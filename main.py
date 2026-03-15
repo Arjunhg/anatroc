@@ -180,6 +180,8 @@ async def run_command(args: argparse.Namespace) -> None:
 def main() -> None:
     """CLI entrypoint."""
     load_dotenv()
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     parser = build_parser()
     args = parser.parse_args()

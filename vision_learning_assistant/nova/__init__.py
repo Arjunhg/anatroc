@@ -1,6 +1,11 @@
 ﻿"""Nova integration package."""
 
 from .bedrock_client import NovaBedrockClient
-from .sonic_stream import DEFAULT_SONIC_SYSTEM_PROMPT, NovaSonicConsoleSession
+from .sonic_stream import DEFAULT_SONIC_SYSTEM_PROMPT, NovaSonicConsoleSession, NovaSonicWebSocketSession
 
-__all__ = ["NovaBedrockClient", "NovaSonicConsoleSession", "DEFAULT_SONIC_SYSTEM_PROMPT"]
+__all__ = [
+    "NovaBedrockClient",
+    "NovaSonicConsoleSession",
+    "NovaSonicWebSocketSession",
+    "DEFAULT_SONIC_SYSTEM_PROMPT",
+]

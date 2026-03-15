@@ -142,10 +142,8 @@ class AssistantConfig:
                 _required_env("NOVA_LITE_MODEL_ID"),
                 "NOVA_LITE_MODEL_ID",
             ),
-            nova_sonic_model_id=_normalize_converse_model_id(
-                _required_env("NOVA_SONIC_MODEL_ID"),
-                "NOVA_SONIC_MODEL_ID",
-            ),
+            # Keep Sonic as configured; bidirectional streaming expects direct model IDs.
+            nova_sonic_model_id=_required_env("NOVA_SONIC_MODEL_ID"),
             nova_embed_model_id=_required_env("NOVA_EMBED_MODEL_ID"),
             nova_embedding_dimension=embedding_dimension,
             nova_text_truncation_mode=text_truncation_mode,

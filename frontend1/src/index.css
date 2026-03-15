@@ -1,0 +1,69 @@
+/* ─── Global Reset & Base ─────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  color-scheme: dark;
+
+  --error:      #e94545;
+
+  --bg-base:      #0d0f14;
+  --bg-card:      #161a23;
+  --bg-elevated:  #1e2330;
+  --bg-hover:     #252b3a;
+
+  --accent:       #5b6ef8;
+  --accent-hover: #6e80ff;
+  --accent-glow:  rgba(91, 110, 248, 0.25);
+
+  --success:      #22c97c;
+  --warning:      #f5a623;
+  --danger:       #e94545;
+  --info:         #38b2e8;
+
+  --text-primary:   #e8ecf2;
+  --text-secondary: #8892a4;
+  --text-muted:     #4e5a6e;
+
+  --border:       rgba(255, 255, 255, 0.08);
+  --border-focus: rgba(91, 110, 248, 0.6);
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+
+  --shadow-md: 0 4px 24px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.55);
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  outline: none;
+  font-family: inherit;
+}
+
+input {
+  font-family: inherit;
+  outline: none;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}

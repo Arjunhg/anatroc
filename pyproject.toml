@@ -1,0 +1,18 @@
+[project]
+name = "anatroc"
+version = "0.1.0"
+description = "Real-Time Multimodal Intelligence, From Edge to Insight."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aws-sdk-bedrock-runtime>=0.4.0",
+    "boto3>=1.42.66",
+    "fastapi>=0.135.1",
+    "psycopg[binary]>=3.3.3",
+    "pyaudio>=0.2.14",
+    "pydantic>=2.12.5",
+    "pyjwt>=2.11.0",
+    "python-dotenv>=1.2.1",
+    "redis>=7.3.0",
+    "uvicorn[standard]>=0.41.0",
+]

@@ -26,7 +26,10 @@ EmbeddingPurpose = Literal[
     "CLUSTERING",
 ]
 
-# We need to use nova embeddings models -> To invoke them we first need to initialize a Bedrock runtime client -> Use this bedrock runtime client to invoke the embedding model with correct payload -> Extract the embedding vector from the response and return it as a list of floats. This will be used by the ContextMemoryService to index content into Aurora(And redis) and for retrieval operations.
+_OCR_EXTRACTION_PROMPT = (
+    "Extract visible text from this screenshot. "
+    "Return plain text only, preserve line breaks when useful, and do not add commentary."
+)
 
 class NovaBedrockClient:
     """Thin wrapper around Bedrock Runtime calls for Nova models."""
@@ -65,7 +68,7 @@ class NovaBedrockClient:
     ) -> list[float]:
         """Generate a Nova embedding vector for the provided text."""
         normalized_text = text.strip()
-        if not normalized_text: # Check if variable is falsy (empty, None, False)
+        if not normalized_text:
             raise ValueError("Cannot embed empty text")
 
         payload = {
@@ -89,7 +92,7 @@ class NovaBedrockClient:
         body = json.loads(response["body"].read())
 
         embeddings = body.get("embeddings")
-        if not isinstance(embeddings, list) or not embeddings: # Empty list is falsy, so this checks for both non-list and empty list
+        if not isinstance(embeddings, list) or not embeddings:
             raise ValueError(
                 "Nova embedding response did not include 'embeddings'. "
                 f"Response keys: {list(body.keys())}"
@@ -102,8 +105,7 @@ class NovaBedrockClient:
         vector = first_embedding.get("embedding")
         if not isinstance(vector, list):
             raise ValueError("Nova embedding response did not contain a numeric embedding vector.")
-        
-        # According to docs embedding is of type -> "embedding": number[] but we want to ensure all values are floats and check dimension
+
         float_vector = [float(value) for value in vector]
         if len(float_vector) != self._embedding_dimension:
             raise ValueError(
@@ -111,6 +113,33 @@ class NovaBedrockClient:
                 f"Expected {self._embedding_dimension}, got {len(float_vector)}."
             )
         return float_vector
+
+    def extract_text_from_image(self, image_bytes: bytes) -> str:
+        """Extract OCR-like text from a screenshot using Nova Lite."""
+        if not image_bytes:
+            return ""
+
+        response = self._client.converse(
+            modelId=self._lite_model_id,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"text": _OCR_EXTRACTION_PROMPT},
+                        {
+                            "image": {
+                                "format": self._detect_image_format(image_bytes),
+                                "source": {"bytes": image_bytes},
+                            }
+                        },
+                    ],
+                }
+            ],
+            inferenceConfig={"maxTokens": 1600, "temperature": 0.0, "topP": 0.1},
+        )
+
+        extracted = self._extract_text_response(response).strip()
+        return extracted
 
     def analyze_screen(
         self,

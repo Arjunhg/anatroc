@@ -1,8 +1,11 @@
-﻿"""Nova-first orchestration pipeline for screen analysis and retrieval."""
+"""Nova-first orchestration pipeline for screen analysis and retrieval."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from vision_learning_assistant.config import AssistantConfig
@@ -13,6 +16,29 @@ from vision_learning_assistant.storage.aurora_store import AuroraVectorStore
 from vision_learning_assistant.storage.redis_cache import RedisCache
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class SessionFrameSnapshot:
+    """Most recent sampled screen frame state for a session."""
+
+    frame_bytes: bytes
+    ocr_text: str
+    source_type: str
+    ingested_at: datetime
+
+
+@dataclass(slots=True)
+class FrameIngestionResult:
+    """Result of a screen frame ingestion request."""
+
+    session_id: str
+    processed: bool
+    skipped_reason: str | None
+    ocr_text: str
+    ocr_record_id: str | None
+    analysis_result: ScreenAnalysisResult | None
+    ingested_at: datetime
 
 
 class VisionLearningPipeline:
@@ -49,6 +75,7 @@ class VisionLearningPipeline:
             memory_service=self._memory,
             capture_interval_seconds=config.screen_capture_interval_seconds,
         )
+        self._session_frames: dict[str, SessionFrameSnapshot] = {}
 
     async def start(self) -> None:
         """Connect to Aurora and Redis resources."""
@@ -77,6 +104,93 @@ class VisionLearningPipeline:
             user_prompt=prompt,
             frame_bytes=frame_bytes,
         )
+
+    async def ingest_screen_frame(
+        self,
+        session_id: str,
+        frame_bytes: bytes,
+        source_type: str = "screen_share",
+        analysis_prompt: str | None = None,
+        force_process: bool = False,
+    ) -> FrameIngestionResult:
+        """Sample, OCR, and index a screen frame for retrieval memory."""
+        if not frame_bytes:
+            raise ValueError("Frame bytes are required for ingestion")
+
+        if not force_process and not self._screen_analysis.should_process_frame(session_id):
+            now = datetime.now(timezone.utc)
+            previous = self._session_frames.get(session_id)
+            return FrameIngestionResult(
+                session_id=session_id,
+                processed=False,
+                skipped_reason="capture_interval_not_elapsed",
+                ocr_text=previous.ocr_text if previous else "",
+                ocr_record_id=None,
+                analysis_result=None,
+                ingested_at=now,
+            )
+
+        ingested_at = datetime.now(timezone.utc)
+        ocr_text = (await asyncio.to_thread(self._nova_client.extract_text_from_image, frame_bytes)).strip()
+
+        ocr_record_id: str | None = None
+        if ocr_text:
+            ocr_record_id = await self._memory.index_content(
+                content=ocr_text,
+                source_type=f"{source_type}_ocr",
+                metadata={
+                    "session_id": session_id,
+                    "captured_at": ingested_at.isoformat(),
+                    "source_type": source_type,
+                },
+            )
+
+        self._session_frames[session_id] = SessionFrameSnapshot(
+            frame_bytes=frame_bytes,
+            ocr_text=ocr_text,
+            source_type=source_type,
+            ingested_at=ingested_at,
+        )
+
+        analysis_result: ScreenAnalysisResult | None = None
+        if analysis_prompt and analysis_prompt.strip():
+            analysis_result = await self._screen_analysis.analyze_screen_frame(
+                session_id=session_id,
+                user_prompt=analysis_prompt,
+                frame_bytes=frame_bytes,
+                ocr_text=ocr_text,
+            )
+
+        return FrameIngestionResult(
+            session_id=session_id,
+            processed=True,
+            skipped_reason=None,
+            ocr_text=ocr_text,
+            ocr_record_id=ocr_record_id,
+            analysis_result=analysis_result,
+            ingested_at=ingested_at,
+        )
+
+    async def answer_with_session_context(self, session_id: str, prompt: str) -> ScreenAnalysisResult:
+        """Answer a user prompt using the latest ingested session frame context."""
+        snapshot = self._session_frames.get(session_id)
+        frame_bytes = snapshot.frame_bytes if snapshot else None
+        ocr_text = snapshot.ocr_text if snapshot else None
+
+        return await self._screen_analysis.analyze_screen_frame(
+            session_id=session_id,
+            user_prompt=prompt,
+            frame_bytes=frame_bytes,
+            ocr_text=ocr_text,
+        )
+
+    def get_session_snapshot(self, session_id: str) -> SessionFrameSnapshot | None:
+        """Return latest frame snapshot for a session if available."""
+        return self._session_frames.get(session_id)
+
+    def clear_session(self, session_id: str) -> None:
+        """Clear in-memory frame state for a session."""
+        self._session_frames.pop(session_id, None)
 
     async def generate_overlay_diagram(self, prompt: str) -> str:
         """Generate Mermaid overlay diagram text from a user request."""
