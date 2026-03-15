@@ -1,0 +1,105 @@
+/* ─── Controls bar ────────────────────────────────────────────────────────── */
+.controls-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  padding: 0.75rem 1.5rem;
+  background: var(--bg-card);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.controls-spacer {
+  flex: 1;
+  max-width: 120px;
+}
+
+/* ─── Individual control buttons ──────────────────────────────────────────── */
+.ctrl-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 0.55rem 1rem;
+  border-radius: var(--radius-md);
+  font-size: 0.75rem;
+  font-weight: 500;
+  transition: background 0.15s, box-shadow 0.15s, transform 0.1s;
+  min-width: 76px;
+}
+
+.ctrl-btn:active {
+  transform: scale(0.95);
+}
+
+.ctrl-btn-icon {
+  font-size: 1.3rem;
+  line-height: 1;
+}
+
+.ctrl-btn-label {
+  color: var(--text-secondary);
+}
+
+/* Active = camera/mic is ON */
+.ctrl-btn--on {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+}
+
+.ctrl-btn--on:hover {
+  background: var(--bg-hover);
+  border-color: rgba(255,255,255,0.15);
+}
+
+/* Off = camera/mic is MUTED */
+.ctrl-btn--off {
+  background: rgba(233, 69, 69, 0.12);
+  border: 1px solid rgba(233, 69, 69, 0.25);
+}
+
+.ctrl-btn--off:hover {
+  background: rgba(233, 69, 69, 0.2);
+}
+
+.ctrl-btn--off .ctrl-btn-label {
+  color: #ff9a9a;
+}
+
+/* Disabled = camera button while sharing screen */
+.ctrl-btn--disabled,
+.ctrl-btn--disabled:hover {
+  opacity: 0.35;
+  cursor: not-allowed;
+  background: var(--bg-elevated) !important;
+  border-color: var(--border) !important;
+  box-shadow: none !important;
+}
+
+/* Highlight = screen share is active */
+.ctrl-btn--highlight {
+  background: rgba(91, 110, 248, 0.15) !important;
+  border-color: rgba(91, 110, 248, 0.4) !important;
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+
+.ctrl-btn--highlight .ctrl-btn-label {
+  color: #a8b4ff;
+}
+
+/* ─── Leave button ────────────────────────────────────────────────────────── */
+.btn-leave {
+  padding: 0.55rem 1.4rem;
+  background: var(--danger);
+  color: #fff;
+  font-size: 0.88rem;
+  font-weight: 600;
+  border-radius: var(--radius-md);
+  transition: background 0.15s, box-shadow 0.15s;
+}
+
+.btn-leave:hover {
+  background: #f05555;
+  box-shadow: 0 4px 16px rgba(233, 69, 69, 0.4);
+}

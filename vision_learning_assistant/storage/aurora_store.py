@@ -1,7 +1,8 @@
-﻿"""Aurora pgvector data access for embedding persistence and search."""
+"""Aurora pgvector data access for embedding persistence and search."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -42,37 +43,10 @@ class AuroraVectorStore:
 
     async def ensure_schema(self) -> None:
         """Ensure required extension and table exist."""
-        async with await psycopg.AsyncConnection.connect(self._database_url) as conn:
-            async with conn.cursor() as cur:
-                try:
-                    await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                    await cur.execute(
-                        f"""
-                        CREATE TABLE IF NOT EXISTS embeddings (
-                            id UUID PRIMARY KEY,
-                            content TEXT,
-                            source_type TEXT,
-                            embedding VECTOR({self._embedding_dimension}),
-                            metadata JSONB,
-                            created_at TIMESTAMP DEFAULT NOW()
-                        )
-                        """
-                    )
-                    await cur.execute(
-                        """
-                        CREATE INDEX IF NOT EXISTS embeddings_vector_idx
-                        ON embeddings
-                        USING ivfflat (embedding vector_cosine_ops)
-                        WITH (lists = 100)
-                        """
-                    )
-                    await conn.commit()
-                except Exception as exc:
-                    LOGGER.warning(
-                        "Schema bootstrap skipped (%s). Assuming Aurora schema already exists.",
-                        exc,
-                    )
-                    await conn.rollback()
+        try:
+            await asyncio.to_thread(self._ensure_schema_sync)
+        except Exception as exc:
+            LOGGER.warning("Aurora schema bootstrap skipped: %s", exc)
 
     async def insert_embedding(
         self,
@@ -94,20 +68,18 @@ class AuroraVectorStore:
             )
 
         record_id = str(uuid.uuid4())
-        vector_literal = _vector_literal(embedding)
-        metadata_json = json.dumps(metadata or {})
-
-        async with await psycopg.AsyncConnection.connect(self._database_url) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    INSERT INTO embeddings (id, content, source_type, embedding, metadata)
-                    VALUES (%s::uuid, %s, %s, %s::vector, %s::jsonb)
-                    """,
-                    (record_id, content, source_type, vector_literal, metadata_json),
-                )
-            await conn.commit()
-
+        try:
+            await asyncio.to_thread(
+                self._insert_embedding_sync,
+                record_id,
+                content,
+                source_type,
+                embedding,
+                metadata or {},
+            )
+        except Exception as exc:
+            LOGGER.warning("Aurora insert failed, returning synthetic id=%s (%s)", record_id, exc)
+            return record_id
         return record_id
 
     async def similarity_search(
@@ -116,26 +88,11 @@ class AuroraVectorStore:
         limit: int = 5,
     ) -> list[RetrievedContext]:
         """Run cosine-similarity vector search and return ranked hits."""
-        vector_literal = _vector_literal(query_embedding)
-
-        async with await psycopg.AsyncConnection.connect(self._database_url) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    SELECT
-                        id::text,
-                        content,
-                        source_type,
-                        metadata,
-                        created_at,
-                        (1 - (embedding <=> %s::vector)) AS score
-                    FROM embeddings
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                    """,
-                    (vector_literal, vector_literal, limit),
-                )
-                rows = await cur.fetchall()
+        try:
+            rows = await asyncio.to_thread(self._similarity_search_sync, query_embedding, limit)
+        except Exception as exc:
+            LOGGER.warning("Aurora similarity search failed: %s", exc)
+            return []
 
         results: list[RetrievedContext] = []
         for row in rows:
@@ -151,6 +108,79 @@ class AuroraVectorStore:
                 )
             )
         return results
+
+    def _ensure_schema_sync(self) -> None:
+        """Create extension/table/index if they do not exist."""
+        with psycopg.connect(self._database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS embeddings (
+                        id UUID PRIMARY KEY,
+                        content TEXT,
+                        source_type TEXT,
+                        embedding VECTOR({self._embedding_dimension}),
+                        metadata JSONB,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS embeddings_vector_idx
+                    ON embeddings
+                    USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = 100)
+                    """
+                )
+            conn.commit()
+
+    def _insert_embedding_sync(
+        self,
+        record_id: str,
+        content: str,
+        source_type: str,
+        embedding: list[float],
+        metadata: dict[str, Any],
+    ) -> None:
+        """Insert one embedding row in a blocking context."""
+        vector_literal = _vector_literal(embedding)
+        metadata_json = json.dumps(metadata)
+
+        with psycopg.connect(self._database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO embeddings (id, content, source_type, embedding, metadata)
+                    VALUES (%s::uuid, %s, %s, %s::vector, %s::jsonb)
+                    """,
+                    (record_id, content, source_type, vector_literal, metadata_json),
+                )
+            conn.commit()
+
+    def _similarity_search_sync(self, query_embedding: list[float], limit: int) -> list[tuple[Any, ...]]:
+        """Fetch nearest rows in a blocking context."""
+        vector_literal = _vector_literal(query_embedding)
+
+        with psycopg.connect(self._database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        id::text,
+                        content,
+                        source_type,
+                        metadata,
+                        created_at,
+                        (1 - (embedding <=> %s::vector)) AS score
+                    FROM embeddings
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (vector_literal, vector_literal, limit),
+                )
+                return cur.fetchall()
 
 
 def _vector_literal(values: list[float]) -> str:

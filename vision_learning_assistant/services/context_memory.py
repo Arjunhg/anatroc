@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from typing import Any
 
 from vision_learning_assistant.nova.bedrock_client import NovaBedrockClient
@@ -97,8 +98,17 @@ class ContextMemoryService:
     @staticmethod
     def _cache_key(question: str, limit: int) -> str:
         """Build deterministic Redis key for retrieval cache entries."""
-        digest = hashlib.sha256(question.lower().encode("utf-8")).hexdigest()
+        normalized_text = ContextMemoryService._normalize_question(question)
+        digest = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
         return f"context:retrieval:{digest}:{limit}"
+    
+    @staticmethod
+    def _normalize_question(question: str) -> str:
+        question = question.lower().strip()
+        question = re.sub(r"[^\w\s]", "", question)   # remove punctuation
+        question = re.sub(r"\s+", " ", question)      # collapse spaces
+        return question
+
 
 
 def _serialize_context(item: RetrievedContext) -> dict[str, Any]:
