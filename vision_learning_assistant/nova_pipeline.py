@@ -7,12 +7,13 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from vision_learning_assistant.config import AssistantConfig
 from vision_learning_assistant.nova.bedrock_client import NovaBedrockClient
 from vision_learning_assistant.services.context_memory import ContextMemoryService
 from vision_learning_assistant.services.screen_analysis import ScreenAnalysisResult, ScreenAnalysisService
-from vision_learning_assistant.storage.aurora_store import AuroraVectorStore
+from vision_learning_assistant.storage.aurora_store import AuroraVectorStore, RetrievedContext
 from vision_learning_assistant.storage.redis_cache import RedisCache
 
 LOGGER = logging.getLogger(__name__)
@@ -182,6 +183,30 @@ class VisionLearningPipeline:
             user_prompt=prompt,
             frame_bytes=frame_bytes,
             ocr_text=ocr_text,
+        )
+
+    async def retrieve_context_memory(
+        self,
+        prompt: str,
+        limit: int | None = None,
+    ) -> list[RetrievedContext]:
+        """Expose shared retrieval memory for non-Lite runtime paths."""
+        return await self._memory.retrieve(prompt, limit)
+
+    async def index_session_memory(
+        self,
+        content: str,
+        source_type: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Persist session memory content when non-empty."""
+        normalized_content = content.strip()
+        if not normalized_content:
+            return None
+        return await self._memory.index_content(
+            content=normalized_content,
+            source_type=source_type,
+            metadata=metadata,
         )
 
     def get_session_snapshot(self, session_id: str) -> SessionFrameSnapshot | None:
