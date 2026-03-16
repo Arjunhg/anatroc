@@ -36,6 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from vision_learning_assistant import AssistantConfig, VisionLearningPipeline
+from vision_learning_assistant.storage.aurora_store import AuroraVectorStore
 from vision_learning_assistant.nova import DEFAULT_SONIC_SYSTEM_PROMPT, NovaSonicWebSocketSession
 from vision_learning_assistant.nova_pipeline import FrameIngestionResult
 from vision_learning_assistant.services.screen_analysis import ScreenAnalysisResult
@@ -150,6 +151,28 @@ class LegacyStopAgentRequest(BaseModel):
     call_id: str | None = None
 
 
+# Aurora maintenance helpers
+def run_vacuum_analyze(pool):
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("VACUUM ANALYZE embeddings;")
+        conn.commit()
+
+def schedule_aurora_maintenance(aurora_store: AuroraVectorStore):
+    import asyncio
+    from datetime import datetime
+    async def maintenance_loop():
+        while True:
+            try:
+                await aurora_store.cleanup_embeddings()
+                # Run VACUUM ANALYZE every 4 hours
+                if int(datetime.now().hour) % 4 == 0:
+                    await asyncio.to_thread(run_vacuum_analyze, aurora_store._pool)
+            except Exception as exc:
+                LOGGER.warning("Aurora maintenance failed: %s", exc)
+            await asyncio.sleep(3600)  # Run every hour
+    asyncio.create_task(maintenance_loop())
+
 app = FastAPI(title="Anatroc Assistant API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -185,7 +208,8 @@ _SONIC_RETRIEVAL_HINTS = (
     "doing",
     "happening",
     "where",
-    "initial"
+    "initial",
+    "initially",
 )
 
 _OVERLAY_GENERATE_HINTS = (
@@ -634,6 +658,7 @@ async def _stop_sonic_websocket(session_id: str) -> None:
     _sonic_bridge_state.pop(session_id, None)
 
 
+
 @app.on_event("startup")
 async def _startup() -> None:
     """Initialize Nova pipeline once on service startup."""
@@ -641,6 +666,14 @@ async def _startup() -> None:
     config = AssistantConfig.from_env()
     _pipeline = VisionLearningPipeline(config)
     await _pipeline.start()
+    # Schedule Aurora maintenance if AuroraVectorStore is present
+    aurora_store = None
+    if hasattr(_pipeline, '_memory') and hasattr(_pipeline._memory, '_vector_store'):
+        aurora_store = _pipeline._memory._vector_store
+    if isinstance(aurora_store, AuroraVectorStore):
+        schedule_aurora_maintenance(aurora_store)
+    elif aurora_store is not None:
+        LOGGER.warning("Aurora maintenance scheduling skipped: unexpected vector store type %s", type(aurora_store))
     LOGGER.info("Nova API server started with mode=%s", config.assistant_mode)
 
 
@@ -1117,6 +1150,7 @@ async def eye_icon() -> FileResponse:
     if not icon.exists():
         raise HTTPException(status_code=404, detail="icon not found")
     return FileResponse(icon)
+
 
 
 def main() -> None:

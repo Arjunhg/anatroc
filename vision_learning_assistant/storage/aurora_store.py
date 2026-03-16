@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from psycopg_pool import ConnectionPool
 
 import psycopg
 
@@ -40,6 +41,12 @@ class AuroraVectorStore:
         self._database_url = database_url
         self._enable_writes = enable_writes
         self._embedding_dimension = embedding_dimension
+
+        self._pool = ConnectionPool(
+            conninfo=database_url,
+            min_size=1,
+            max_size=10,
+        )
 
     async def ensure_schema(self) -> None:
         """Ensure required extension and table exist."""
@@ -111,7 +118,7 @@ class AuroraVectorStore:
 
     def _ensure_schema_sync(self) -> None:
         """Create extension/table/index if they do not exist."""
-        with psycopg.connect(self._database_url) as conn:
+        with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
                 cur.execute(
@@ -148,7 +155,7 @@ class AuroraVectorStore:
         vector_literal = _vector_literal(embedding)
         metadata_json = json.dumps(metadata)
 
-        with psycopg.connect(self._database_url) as conn:
+        with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -163,7 +170,7 @@ class AuroraVectorStore:
         """Fetch nearest rows in a blocking context."""
         vector_literal = _vector_literal(query_embedding)
 
-        with psycopg.connect(self._database_url) as conn:
+        with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -175,7 +182,8 @@ class AuroraVectorStore:
                         created_at,
                         (1 - (embedding <=> %s::vector)) AS score
                     FROM embeddings
-                    ORDER BY embedding <=> %s::vector
+                    WHERE created_at > NOW() - INTERVAL '10 minutes'
+                    ORDER by embedding <=> %s::vector
                     LIMIT %s
                     """,
                     (vector_literal, vector_literal, limit),
@@ -186,3 +194,20 @@ class AuroraVectorStore:
 def _vector_literal(values: list[float]) -> str:
     """Convert Python float list to PostgreSQL vector literal."""
     return "[" + ",".join(f"{float(value):.8f}" for value in values) + "]"
+
+# Long term memory of 24 hours. Short term is of 10 miniues defined in similarity search.
+async def cleanup_embeddings(self) -> None:
+    await asyncio.to_thread(self._cleanup_embeddings_sync)
+
+def _cleanup_embeddings_sync(self) -> None:
+    """Delete rows older than retention period."""
+    with self._pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                    DELETE FROM embeddings
+                    WHERE created_at < NOW() - INTERVAL '24 hours'
+                """
+            )
+        conn.commit()
+
