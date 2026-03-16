@@ -83,6 +83,11 @@ class SessionRuntimeState:
     last_ingested_at: datetime | None = None
     last_ocr_text: str = ""
     last_response_text: str = ""
+    overlay_mermaid: str = ""
+    overlay_prompt: str = ""
+    overlay_updated_at: datetime | None = None
+    overlay_position: str = "top-left"
+    overlay_minimized: bool = False
 
 
 @dataclass(slots=True)
@@ -181,6 +186,46 @@ _SONIC_RETRIEVAL_HINTS = (
     "happening",
     "where",
     "initial"
+)
+
+_OVERLAY_GENERATE_HINTS = (
+    "diagram",
+    "architecture",
+    "flow",
+    "flowchart",
+    "sequence",
+    "workflow",
+    "mermaid",
+)
+
+_OVERLAY_CLEAR_HINTS = (
+    "remove overlay",
+    "delete overlay",
+    "clear overlay",
+    "hide overlay",
+    "close overlay",
+)
+
+_OVERLAY_EXPORT_HINTS = (
+    "export overlay",
+    "export diagram",
+    "download overlay",
+    "download diagram",
+    "copy overlay",
+    "copy diagram",
+)
+
+_OVERLAY_MINIMIZE_HINTS = (
+    "minimize overlay",
+    "collapse overlay",
+    "shrink overlay",
+)
+
+_OVERLAY_EXPAND_HINTS = (
+    "expand overlay",
+    "maximize overlay",
+    "open overlay",
+    "restore overlay",
 )
 
 
@@ -297,6 +342,79 @@ def _should_retrieve_sonic_context(prompt: str) -> bool:
     return any(keyword in normalized for keyword in _SONIC_RETRIEVAL_HINTS)
 
 
+def _should_generate_overlay(prompt: str) -> bool:
+    """Detect whether the user is asking for a visual flow/diagram overlay."""
+    normalized = prompt.lower().strip()
+    if not normalized:
+        return False
+    if any(hint in normalized for hint in _OVERLAY_CLEAR_HINTS):
+        return False
+    if not any(hint in normalized for hint in _OVERLAY_GENERATE_HINTS):
+        return False
+    return any(
+        verb in normalized
+        for verb in ("generate", "draw", "show", "create", "build", "make", "overlay")
+    )
+
+
+def _should_clear_overlay(prompt: str) -> bool:
+    """Detect voice commands that remove the active overlay."""
+    normalized = prompt.lower().strip()
+    if not normalized:
+        return False
+    return any(hint in normalized for hint in _OVERLAY_CLEAR_HINTS)
+
+
+def _should_export_overlay(prompt: str) -> bool:
+    """Detect voice commands that request Mermaid export/copy."""
+    normalized = prompt.lower().strip()
+    if not normalized:
+        return False
+    return any(hint in normalized for hint in _OVERLAY_EXPORT_HINTS)
+
+
+def _should_minimize_overlay(prompt: str) -> bool:
+    """Detect voice commands that minimize overlay card."""
+    normalized = prompt.lower().strip()
+    if not normalized:
+        return False
+    return any(hint in normalized for hint in _OVERLAY_MINIMIZE_HINTS)
+
+
+def _should_expand_overlay(prompt: str) -> bool:
+    """Detect voice commands that restore expanded overlay card."""
+    normalized = prompt.lower().strip()
+    if not normalized:
+        return False
+    return any(hint in normalized for hint in _OVERLAY_EXPAND_HINTS)
+
+
+def _extract_overlay_position(prompt: str) -> str | None:
+    """Infer target overlay position from voice command."""
+    normalized = prompt.lower().strip()
+    if "overlay" not in normalized and "diagram" not in normalized:
+        return None
+    if "top left" in normalized or "upper left" in normalized:
+        return "top-left"
+    if "top right" in normalized or "upper right" in normalized:
+        return "top-right"
+    if "bottom left" in normalized or "lower left" in normalized:
+        return "bottom-left"
+    if "bottom right" in normalized or "lower right" in normalized:
+        return "bottom-right"
+    if "center" in normalized or "middle" in normalized:
+        return "center"
+    if "left" in normalized:
+        return "top-left"
+    if "right" in normalized:
+        return "top-right"
+    if "bottom" in normalized:
+        return "bottom-left"
+    if "top" in normalized:
+        return "top-left"
+    return None
+
+
 async def _persist_sonic_memory(
     pipeline: VisionLearningPipeline,
     session_id: str,
@@ -327,6 +445,117 @@ async def _persist_sonic_memory(
             record_id,
         )
     return record_id
+
+
+async def _handle_sonic_overlay_intent(
+    pipeline: VisionLearningPipeline,
+    session_state: SessionRuntimeState,
+    user_prompt: str,
+    websocket: WebSocket,
+) -> None:
+    """Generate or clear session overlay diagrams based on a voice turn."""
+    normalized_prompt = user_prompt.strip()
+    if not normalized_prompt:
+        return
+
+    if _should_clear_overlay(normalized_prompt):
+        session_state.overlay_mermaid = ""
+        session_state.overlay_prompt = ""
+        session_state.overlay_updated_at = datetime.now(timezone.utc)
+        session_state.overlay_minimized = False
+        await websocket.send_json(
+            {
+                "type": "overlay_clear",
+                "source": "voice_intent",
+            }
+        )
+        LOGGER.info("Cleared overlay for session=%s from voice intent", session_state.session_id)
+        return
+
+    if session_state.overlay_mermaid.strip():
+        requested_position = _extract_overlay_position(normalized_prompt)
+        if requested_position and requested_position != session_state.overlay_position:
+            session_state.overlay_position = requested_position
+            await websocket.send_json(
+                {
+                    "type": "overlay_control",
+                    "action": "move",
+                    "position": requested_position,
+                    "source": "voice_intent",
+                }
+            )
+            LOGGER.info("Moved overlay for session=%s to %s", session_state.session_id, requested_position)
+            return
+
+        if _should_minimize_overlay(normalized_prompt):
+            session_state.overlay_minimized = True
+            await websocket.send_json(
+                {
+                    "type": "overlay_control",
+                    "action": "minimize",
+                    "source": "voice_intent",
+                }
+            )
+            return
+
+        if _should_expand_overlay(normalized_prompt):
+            session_state.overlay_minimized = False
+            await websocket.send_json(
+                {
+                    "type": "overlay_control",
+                    "action": "expand",
+                    "source": "voice_intent",
+                }
+            )
+            return
+
+        if _should_export_overlay(normalized_prompt):
+            await websocket.send_json(
+                {
+                    "type": "overlay_export",
+                    "mermaid": session_state.overlay_mermaid,
+                    "prompt": session_state.overlay_prompt,
+                    "session_id": session_state.session_id,
+                    "source": "voice_intent",
+                }
+            )
+            return
+
+    if not _should_generate_overlay(normalized_prompt):
+        return
+
+    try:
+        mermaid = await pipeline.generate_overlay_diagram(normalized_prompt)
+    except Exception as exc:
+        LOGGER.warning("Overlay diagram generation failed for session=%s: %s", session_state.session_id, exc)
+        await websocket.send_json(
+            {
+                "type": "overlay_error",
+                "message": str(exc),
+            }
+        )
+        return
+
+    normalized_mermaid = mermaid.strip()
+    if not normalized_mermaid:
+        return
+
+    session_state.overlay_mermaid = normalized_mermaid
+    session_state.overlay_prompt = normalized_prompt
+    session_state.overlay_updated_at = datetime.now(timezone.utc)
+    session_state.overlay_minimized = False
+    await websocket.send_json(
+        {
+            "type": "overlay_diagram",
+            "mermaid": normalized_mermaid,
+            "prompt": normalized_prompt,
+            "source": "voice_intent",
+            "updated_at": session_state.overlay_updated_at.isoformat(),
+            "position": session_state.overlay_position,
+            "minimized": session_state.overlay_minimized,
+        }
+    )
+    LOGGER.info("Generated overlay diagram for session=%s", session_state.session_id)
 
 
 async def _build_sonic_context_payload(
@@ -497,6 +726,11 @@ async def session_state(session_id: str) -> dict[str, Any]:
         "last_ingested_at": state.last_ingested_at.isoformat() if state.last_ingested_at else None,
         "last_ocr_text": state.last_ocr_text,
         "last_response_text": state.last_response_text,
+        "overlay_prompt": state.overlay_prompt,
+        "overlay_mermaid": state.overlay_mermaid,
+        "overlay_updated_at": state.overlay_updated_at.isoformat() if state.overlay_updated_at else None,
+        "overlay_position": state.overlay_position,
+        "overlay_minimized": state.overlay_minimized,
         "has_latest_frame": snapshot is not None,
         "latest_frame_source_type": snapshot.source_type if snapshot else None,
         "latest_frame_ingested_at": snapshot.ingested_at.isoformat() if snapshot else None,
@@ -628,6 +862,18 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
                 "output_sample_rate_hz": sonic.output_sample_rate_hz,
             }
         )
+        if state.overlay_mermaid.strip():
+            await websocket.send_json(
+                {
+                    "type": "overlay_diagram",
+                    "mermaid": state.overlay_mermaid,
+                    "prompt": state.overlay_prompt,
+                    "source": "session_state",
+                    "updated_at": state.overlay_updated_at.isoformat() if state.overlay_updated_at else None,
+                    "position": state.overlay_position,
+                    "minimized": state.overlay_minimized,
+                }
+            )
 
         async def _upstream_loop() -> None:
             def _avg_abs_pcm16(audio_bytes: bytes) -> float:
@@ -679,6 +925,12 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
                             "sonic_user_turn",
                             bridge_state.user_turn_count,
                         )
+                        await _handle_sonic_overlay_intent(
+                            _pipeline,
+                            state,
+                            user_prompt,
+                            websocket,
+                        )
                     context_payload, retrieved_count = await _build_sonic_context_payload(
                         _pipeline,
                         normalized_session_id,
@@ -709,6 +961,63 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
                     context_text = str(payload.get("text", "")).strip()
                     if context_text:
                         await sonic.send_context_update(context_text[:4000])
+                    continue
+
+                if msg_type == "overlay_clear":
+                    state.overlay_mermaid = ""
+                    state.overlay_prompt = ""
+                    state.overlay_updated_at = datetime.now(timezone.utc)
+                    state.overlay_minimized = False
+                    await websocket.send_json(
+                        {
+                            "type": "overlay_clear",
+                            "source": "client_request",
+                        }
+                    )
+                    continue
+
+                if msg_type == "overlay_control":
+                    action = str(payload.get("action", "")).strip().lower()
+                    if action == "move":
+                        position = str(payload.get("position", "")).strip().lower()
+                        if position in {"top-left", "top-right", "bottom-left", "bottom-right", "center"}:
+                            state.overlay_position = position
+                            await websocket.send_json(
+                                {
+                                    "type": "overlay_control",
+                                    "action": "move",
+                                    "position": position,
+                                    "source": "client_request",
+                                }
+                            )
+                    elif action == "minimize":
+                        state.overlay_minimized = True
+                        await websocket.send_json(
+                            {
+                                "type": "overlay_control",
+                                "action": "minimize",
+                                "source": "client_request",
+                            }
+                        )
+                    elif action == "expand":
+                        state.overlay_minimized = False
+                        await websocket.send_json(
+                            {
+                                "type": "overlay_control",
+                                "action": "expand",
+                                "source": "client_request",
+                            }
+                        )
+                    elif action == "export" and state.overlay_mermaid.strip():
+                        await websocket.send_json(
+                            {
+                                "type": "overlay_export",
+                                "mermaid": state.overlay_mermaid,
+                                "prompt": state.overlay_prompt,
+                                "session_id": state.session_id,
+                                "source": "client_request",
+                            }
+                        )
                     continue
 
                 if msg_type == "stop":

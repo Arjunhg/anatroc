@@ -302,6 +302,163 @@
   margin-bottom: 0.7rem;
 }
 
+.diagram-overlay-shell {
+  position: fixed;
+  inset: 64px 380px 84px 12px;
+  pointer-events: none;
+  z-index: 45;
+  display: flex;
+  justify-content: flex-start;
+  align-items: flex-start;
+}
+
+.diagram-overlay-shell--top-left {
+  justify-content: flex-start;
+  align-items: flex-start;
+}
+
+.diagram-overlay-shell--top-right {
+  justify-content: flex-end;
+  align-items: flex-start;
+}
+
+.diagram-overlay-shell--bottom-left {
+  justify-content: flex-start;
+  align-items: flex-end;
+}
+
+.diagram-overlay-shell--bottom-right {
+  justify-content: flex-end;
+  align-items: flex-end;
+}
+
+.diagram-overlay-shell--center {
+  justify-content: center;
+  align-items: center;
+}
+
+.diagram-overlay-card {
+  pointer-events: auto;
+  width: min(780px, 92vw);
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  border-radius: 14px;
+  border: 1px solid rgba(161, 173, 255, 0.45);
+  background: linear-gradient(145deg, rgba(19, 27, 44, 0.96), rgba(16, 20, 33, 0.96));
+  box-shadow: 0 24px 45px rgba(2, 9, 22, 0.52);
+  overflow: hidden;
+}
+
+.diagram-overlay-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.9rem;
+  padding: 0.8rem 0.9rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.11);
+}
+
+.diagram-overlay-meta {
+  min-width: 0;
+}
+
+.diagram-overlay-title {
+  margin: 0;
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: #f0f4ff;
+}
+
+.diagram-overlay-subtitle {
+  margin: 0.25rem 0 0;
+  font-size: 0.74rem;
+  color: #a7b4cf;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.diagram-overlay-time {
+  margin: 0.22rem 0 0;
+  font-size: 0.66rem;
+  color: #8090b0;
+}
+
+.diagram-overlay-close {
+  align-self: flex-start;
+  border: 1px solid rgba(231, 113, 113, 0.55);
+  background: rgba(231, 113, 113, 0.14);
+  color: #ffd3d3;
+  border-radius: 8px;
+  padding: 0.35rem 0.7rem;
+  font-size: 0.74rem;
+  font-weight: 600;
+}
+
+.diagram-overlay-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.diagram-overlay-btn,
+.diagram-overlay-pos-btn {
+  border: 1px solid rgba(173, 197, 255, 0.38);
+  background: rgba(113, 143, 218, 0.18);
+  color: #e0ebff;
+  border-radius: 8px;
+  padding: 0.3rem 0.55rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
+.diagram-overlay-position-bar {
+  display: flex;
+  gap: 0.35rem;
+  padding: 0.55rem 0.72rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.diagram-overlay-content {
+  overflow: auto;
+  padding: 0.72rem;
+}
+
+.diagram-overlay-loading {
+  margin: 0;
+  font-size: 0.76rem;
+  color: #adc1f4;
+}
+
+.diagram-overlay-error {
+  color: #ffd3d3;
+  font-size: 0.76rem;
+}
+
+.diagram-overlay-error pre {
+  margin-top: 0.5rem;
+  max-height: 210px;
+  overflow: auto;
+  padding: 0.52rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(0, 0, 0, 0.28);
+  color: #f5f7ff;
+}
+
+.diagram-overlay-svg {
+  min-height: 80px;
+  padding: 0.5rem;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  background: rgba(5, 10, 20, 0.35);
+}
+
+.diagram-overlay-svg svg {
+  width: 100%;
+  height: auto;
+}
+
 @media (max-width: 1180px) {
   .call-body {
     grid-template-columns: 1fr 320px;
@@ -317,5 +474,13 @@
   .nova-panel {
     border-left: none;
     border-top: 1px solid var(--border);
+  }
+
+  .diagram-overlay-shell {
+    inset: 58px 10px 352px 10px;
+  }
+
+  .diagram-overlay-card {
+    width: 100%;
   }
 }

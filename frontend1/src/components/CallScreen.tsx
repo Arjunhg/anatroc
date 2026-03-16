@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { ParticipantView, useCall, useCallStateHooks } from '@stream-io/video-react-sdk'
 import { generateDiagram, ingestScreenFrame, queryNova } from '../novaApi'
 import { sonicWsUrl } from '../stream'
+import DiagramOverlay from './DiagramOverlay'
 import Controls from './Controls'
 import './CallScreen.css'
 
@@ -13,6 +14,14 @@ interface Props {
 interface PlaybackChunk {
   samples: Float32Array<ArrayBufferLike>
   sampleRateHz: number
+}
+
+interface SessionOverlayDiagram {
+  mermaid: string
+  prompt: string
+  updatedAt: string | null
+  position: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' | 'center'
+  minimized: boolean
 }
 
 const CAPTURE_INTERVAL_MS = Math.max(
@@ -103,6 +112,7 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
   const [sonicStatus, setSonicStatus] = useState('Disconnected')
   const [sonicUserTranscript, setSonicUserTranscript] = useState('')
   const [sonicAssistantTranscript, setSonicAssistantTranscript] = useState('')
+  const [overlayDiagram, setOverlayDiagram] = useState<SessionOverlayDiagram | null>(null)
 
   const ingestBusyRef = useRef(false)
   const analysisPromptRef = useRef('')
@@ -280,6 +290,90 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
         }
         if (eventType === 'assistant_interrupted') {
           playbackQueueRef.current = []
+          return
+        }
+        if (eventType === 'overlay_diagram') {
+          const mermaid = String(payload.mermaid ?? '').trim()
+          if (!mermaid) return
+          const prompt = String(payload.prompt ?? '').trim()
+          const updatedAt = payload.updated_at ? String(payload.updated_at) : null
+          const rawPosition = String(payload.position ?? 'top-left').trim().toLowerCase()
+          const position =
+            rawPosition === 'top-right' ||
+            rawPosition === 'bottom-left' ||
+            rawPosition === 'bottom-right' ||
+            rawPosition === 'center'
+              ? rawPosition
+              : 'top-left'
+          const minimized = Boolean(payload.minimized ?? false)
+          setOverlayDiagram({
+            mermaid,
+            prompt,
+            updatedAt,
+            position,
+            minimized,
+          })
+          return
+        }
+        if (eventType === 'overlay_control') {
+          const action = String(payload.action ?? '').trim().toLowerCase()
+          if (action === 'move') {
+            const rawPosition = String(payload.position ?? '').trim().toLowerCase()
+            setOverlayDiagram((prev) => {
+              if (!prev) return prev
+              const position =
+                rawPosition === 'top-right' ||
+                rawPosition === 'bottom-left' ||
+                rawPosition === 'bottom-right' ||
+                rawPosition === 'center'
+                  ? rawPosition
+                  : 'top-left'
+              return { ...prev, position }
+            })
+            return
+          }
+          if (action === 'minimize') {
+            setOverlayDiagram((prev) => (prev ? { ...prev, minimized: true } : prev))
+            return
+          }
+          if (action === 'expand') {
+            setOverlayDiagram((prev) => (prev ? { ...prev, minimized: false } : prev))
+            return
+          }
+          return
+        }
+        if (eventType === 'overlay_export') {
+          const mermaid = String(payload.mermaid ?? '').trim()
+          if (!mermaid) return
+          const exportText = mermaid.endsWith('\n') ? mermaid : `${mermaid}\n`
+          const nowStamp = new Date().toISOString().replace(/[:.]/g, '-')
+          const fileName = `mermaid-overlay-${sessionId}-${nowStamp}.mmd`
+          void navigator.clipboard
+            .writeText(exportText)
+            .then(() => {
+              setSonicStatus('Overlay Mermaid copied to clipboard')
+            })
+            .catch(() => {
+              const blob = new Blob([exportText], { type: 'text/plain;charset=utf-8' })
+              const url = URL.createObjectURL(blob)
+              const anchor = document.createElement('a')
+              anchor.href = url
+              anchor.download = fileName
+              document.body.append(anchor)
+              anchor.click()
+              anchor.remove()
+              URL.revokeObjectURL(url)
+              setSonicStatus(`Overlay Mermaid downloaded as ${fileName}`)
+            })
+          return
+        }
+        if (eventType === 'overlay_clear') {
+          setOverlayDiagram(null)
+          return
+        }
+        if (eventType === 'overlay_error') {
+          const message = String(payload.message ?? 'Unable to generate overlay diagram')
+          setSonicStatus(`Overlay error: ${message}`)
           return
         }
         if (eventType === 'error') {
@@ -466,10 +560,47 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
     try {
       const mermaid = await generateDiagram(normalized)
       setDiagramOutput(mermaid)
+      setOverlayDiagram({
+        mermaid,
+        prompt: normalized,
+        updatedAt: new Date().toISOString(),
+        position: 'top-left',
+        minimized: false,
+      })
     } catch (error) {
       setDiagramOutput(error instanceof Error ? error.message : String(error))
     } finally {
       setDiagramBusy(false)
+    }
+  }
+
+  const handleRemoveOverlay = () => {
+    setOverlayDiagram(null)
+    const socket = sonicSocketRef.current
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'overlay_clear' }))
+    }
+  }
+
+  const handleOverlayControl = (action: 'move' | 'minimize' | 'expand' | 'export', position?: SessionOverlayDiagram['position']) => {
+    const socket = sonicSocketRef.current
+    if (action === 'move' && position) {
+      setOverlayDiagram((prev) => (prev ? { ...prev, position } : prev))
+    }
+    if (action === 'minimize') {
+      setOverlayDiagram((prev) => (prev ? { ...prev, minimized: true } : prev))
+    }
+    if (action === 'expand') {
+      setOverlayDiagram((prev) => (prev ? { ...prev, minimized: false } : prev))
+    }
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(
+        JSON.stringify({
+          type: 'overlay_control',
+          action,
+          position,
+        }),
+      )
     }
   }
 
@@ -618,6 +749,18 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
           </label>
         </aside>
       </div>
+
+      {overlayDiagram ? (
+        <DiagramOverlay
+          mermaidText={overlayDiagram.mermaid}
+          prompt={overlayDiagram.prompt}
+          updatedAt={overlayDiagram.updatedAt}
+          position={overlayDiagram.position}
+          minimized={overlayDiagram.minimized}
+          onClose={handleRemoveOverlay}
+          onControl={handleOverlayControl}
+        />
+      ) : null}
 
       <Controls onLeave={onLeave} />
     </div>
