@@ -17,10 +17,11 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,18 @@ class SessionRuntimeState:
     last_ingested_at: datetime | None = None
     last_ocr_text: str = ""
     last_response_text: str = ""
+
+
+@dataclass(slots=True)
+class SonicBridgeState:
+    """Transient per-session Sonic state used for retrieval-grounded turns."""
+
+    current_user_transcript_parts: list[str] = field(default_factory=list)
+    current_assistant_transcript_parts: list[str] = field(default_factory=list)
+    last_context_payload: str = ""
+    last_retrieval_at_monotonic: float = 0.0
+    user_turn_count: int = 0
+    assistant_turn_count: int = 0
 
 
 class StartSessionRequest(BaseModel):
@@ -150,6 +163,25 @@ _pipeline: VisionLearningPipeline | None = None
 _sessions: dict[str, SessionRuntimeState] = {}
 _sonic_sessions: dict[str, NovaSonicWebSocketSession] = {}
 _sonic_websockets: dict[str, WebSocket] = {}
+_sonic_bridge_state: dict[str, SonicBridgeState] = {}
+
+_SONIC_RETRIEVAL_HINTS = (
+    "start",
+    "earlier",
+    "before",
+    "previous",
+    "history",
+    "summary",
+    "summarize",
+    "recap",
+    "flow",
+    "timeline",
+    "done",
+    "doing",
+    "happening",
+    "where",
+    "initial"
+)
 
 
 def _generate_token(user_id: str) -> str:
@@ -233,6 +265,125 @@ def _serialize_frame_ingestion(result: FrameIngestionResult) -> dict[str, Any]:
     return payload
 
 
+def _append_transcript_chunk(chunks: list[str], text: str) -> None:
+    """Append a transcript chunk while avoiding immediate duplicates."""
+    normalized = text.strip()
+    if not normalized:
+        return
+    if chunks and chunks[-1] == normalized:
+        return
+    chunks.append(normalized)
+
+
+def _collapse_transcript_chunks(chunks: list[str]) -> str:
+    """Collapse transcript chunks into one readable sentence."""
+    collapsed = " ".join(chunk.strip() for chunk in chunks if chunk.strip())
+    return re.sub(r"\s+", " ", collapsed).strip()
+
+
+def _clip_text(text: str, max_chars: int) -> str:
+    """Clip long text blocks to a bounded size for Sonic context injection."""
+    normalized = text.strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def _should_retrieve_sonic_context(prompt: str) -> bool:
+    """Use a lightweight heuristic to limit expensive retrievals to memory-seeking turns."""
+    normalized = prompt.lower().strip()
+    if not normalized:
+        return False
+    return any(keyword in normalized for keyword in _SONIC_RETRIEVAL_HINTS)
+
+
+async def _persist_sonic_memory(
+    pipeline: VisionLearningPipeline,
+    session_id: str,
+    content: str,
+    source_type: str,
+    turn_index: int,
+) -> str | None:
+    """Persist a Sonic turn into Aurora-backed memory when text is available."""
+    normalized = content.strip()
+    if not normalized:
+        return None
+    record_id = await pipeline.index_session_memory(
+        content=normalized,
+        source_type=source_type,
+        metadata={
+            "session_id": session_id,
+            "turn_index": turn_index,
+            "channel": "sonic_websocket",
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    if record_id:
+        LOGGER.info(
+            "Persisted Sonic memory session=%s source_type=%s turn=%d record_id=%s",
+            session_id,
+            source_type,
+            turn_index,
+            record_id,
+        )
+    return record_id
+
+
+async def _build_sonic_context_payload(
+    pipeline: VisionLearningPipeline,
+    session_id: str,
+    user_prompt: str,
+    bridge_state: SonicBridgeState,
+) -> tuple[str, int]:
+    """Build a compact retrieval-grounded context payload for Sonic."""
+    config = pipeline.config
+    sections: list[str] = []
+    used_chars = 0
+
+    snapshot = pipeline.get_session_snapshot(session_id)
+    latest_ocr = snapshot.ocr_text.strip() if snapshot and snapshot.ocr_text.strip() else ""
+    if latest_ocr:
+        ocr_block = _clip_text(latest_ocr, min(config.sonic_context_max_total_chars, config.sonic_context_max_chars_per_hit))
+        sections.append(f"[Current screen OCR]\n{ocr_block}")
+        used_chars += len(ocr_block)
+
+    retrieved_count = 0
+    now_monotonic = time.monotonic()
+    retrieval_allowed = (
+        config.enable_sonic_context_retrieval
+        and user_prompt.strip()
+        and _should_retrieve_sonic_context(user_prompt)
+        and (
+            bridge_state.last_retrieval_at_monotonic <= 0.0
+            or now_monotonic - bridge_state.last_retrieval_at_monotonic
+            >= config.sonic_context_retrieval_cooldown_seconds
+        )
+    )
+    if retrieval_allowed:
+        retrieved = await pipeline.retrieve_context_memory(
+            user_prompt,
+            limit=config.sonic_context_max_results,
+        )
+        bridge_state.last_retrieval_at_monotonic = now_monotonic
+        seen_contents = {latest_ocr}
+        memory_lines: list[str] = []
+        for item in retrieved:
+            clipped = _clip_text(item.content, config.sonic_context_max_chars_per_hit)
+            if not clipped or clipped in seen_contents:
+                continue
+            projected_chars = used_chars + len(clipped)
+            if projected_chars > config.sonic_context_max_total_chars:
+                break
+            seen_contents.add(clipped)
+            memory_lines.append(f"- ({item.source_type}, score={item.score:.2f}) {clipped}")
+            used_chars = projected_chars
+        if memory_lines:
+            sections.append("[Retrieved memory]\n" + "\n".join(memory_lines))
+            retrieved_count = len(memory_lines)
+
+    return "\n\n".join(section for section in sections if section.strip()), retrieved_count
+
+
 async def _stop_sonic_session(session_id: str) -> None:
     """Close and remove active Sonic session bridge for a session."""
     sonic = _sonic_sessions.pop(session_id, None)
@@ -251,6 +402,7 @@ async def _stop_sonic_websocket(session_id: str) -> None:
         return
     with contextlib.suppress(Exception):
         await websocket.close(code=1000, reason="Session stopped")
+    _sonic_bridge_state.pop(session_id, None)
 
 
 @app.on_event("startup")
@@ -446,6 +598,7 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
 
     await websocket.accept()
     state = _ensure_session(normalized_session_id)
+    bridge_state = _sonic_bridge_state.setdefault(normalized_session_id, SonicBridgeState())
     existing_websocket = _sonic_websockets.get(normalized_session_id)
     if existing_websocket is not None and existing_websocket is not websocket:
         with contextlib.suppress(Exception):
@@ -465,7 +618,9 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
     try:
         await sonic.start()
         if state.last_ocr_text.strip():
-            await sonic.send_context_update(state.last_ocr_text.strip()[:4000])
+            initial_context = state.last_ocr_text.strip()[:4000]
+            await sonic.send_context_update(initial_context)
+            bridge_state.last_context_payload = f"[Current screen OCR]\n{initial_context}"
         await websocket.send_json(
             {
                 "type": "ready",
@@ -513,6 +668,40 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
 
                 if msg_type == "audio_turn_end":
                     LOGGER.info("Sonic audio turn end received for session=%s", normalized_session_id)
+                    await asyncio.sleep(0.15)
+                    user_prompt = _collapse_transcript_chunks(bridge_state.current_user_transcript_parts)
+                    if user_prompt:
+                        bridge_state.user_turn_count += 1
+                        await _persist_sonic_memory(
+                            _pipeline,
+                            normalized_session_id,
+                            user_prompt,
+                            "sonic_user_turn",
+                            bridge_state.user_turn_count,
+                        )
+                    context_payload, retrieved_count = await _build_sonic_context_payload(
+                        _pipeline,
+                        normalized_session_id,
+                        user_prompt,
+                        bridge_state,
+                    )
+                    if context_payload and context_payload != bridge_state.last_context_payload:
+                        await sonic.send_context_update(context_payload)
+                        bridge_state.last_context_payload = context_payload
+                        LOGGER.info(
+                            "Applied Sonic context session=%s retrieved_hits=%d ocr_present=%s",
+                            normalized_session_id,
+                            retrieved_count,
+                            "[Current screen OCR]" in context_payload,
+                        )
+                        await websocket.send_json(
+                            {
+                                "type": "context_applied",
+                                "retrieved_hits": retrieved_count,
+                                "has_current_ocr": "[Current screen OCR]" in context_payload,
+                            }
+                        )
+                    bridge_state.current_user_transcript_parts.clear()
                     await sonic.end_user_audio_turn()
                     continue
 
@@ -534,10 +723,35 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
                 event = await sonic.next_event()
                 downstream_count += 1
                 event_type = str(event.get("type", ""))
+                if event_type == "transcript":
+                    role = str(event.get("role", "")).lower()
+                    text = str(event.get("text", ""))
+                    if role == "user":
+                        _append_transcript_chunk(bridge_state.current_user_transcript_parts, text)
+                    elif role == "assistant":
+                        _append_transcript_chunk(bridge_state.current_assistant_transcript_parts, text)
+                elif event_type == "content_end":
+                    role = str(event.get("role", "")).lower()
+                    if role == "assistant":
+                        assistant_text = _collapse_transcript_chunks(bridge_state.current_assistant_transcript_parts)
+                        if assistant_text:
+                            bridge_state.assistant_turn_count += 1
+                            await _persist_sonic_memory(
+                                _pipeline,
+                                normalized_session_id,
+                                assistant_text,
+                                "sonic_assistant_turn",
+                                bridge_state.assistant_turn_count,
+                            )
+                        bridge_state.current_assistant_transcript_parts.clear()
+                    elif role == "user":
+                        bridge_state.current_user_transcript_parts.clear()
+                elif event_type == "assistant_interrupted":
+                    bridge_state.current_assistant_transcript_parts.clear()
                 if (
                     downstream_count == 1
                     or downstream_count % 50 == 0
-                    or event_type in {"error", "transcript", "assistant_interrupted", "session_end"}
+                    or event_type in {"content_end", "error", "transcript", "assistant_interrupted", "session_end"}
                 ):
                     LOGGER.info(
                         "Sonic downstream session=%s count=%d type=%s role=%s text_len=%d",
@@ -571,6 +785,7 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
             await websocket.send_json({"type": "error", "message": str(exc)})
     finally:
         await _stop_sonic_session(normalized_session_id)
+        _sonic_bridge_state.pop(normalized_session_id, None)
         if _sonic_websockets.get(normalized_session_id) is websocket:
             _sonic_websockets.pop(normalized_session_id, None)
         with contextlib.suppress(Exception):

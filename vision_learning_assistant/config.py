@@ -92,9 +92,14 @@ class AssistantConfig:
     session_timeout_seconds: int
     screen_capture_interval_seconds: float
     max_retrieval_results: int
+    sonic_context_max_results: int
+    sonic_context_max_chars_per_hit: int
+    sonic_context_max_total_chars: int
+    sonic_context_retrieval_cooldown_seconds: float
 
     enable_aurora_writes: bool
     enable_redis_cache: bool
+    enable_sonic_context_retrieval: bool
 
     @property
     def is_screen_share_mode(self) -> bool:
@@ -153,6 +158,11 @@ class AssistantConfig:
             session_timeout_seconds=_env_int("SESSION_TIMEOUT", 1800),
             screen_capture_interval_seconds=_env_float("SCREEN_CAPTURE_INTERVAL", 4.0),
             max_retrieval_results=_env_int("MAX_RETRIEVAL_RESULTS", 5),
+            sonic_context_max_results=_env_int("SONIC_CONTEXT_MAX_RESULTS", 4),
+            sonic_context_max_chars_per_hit=_env_int("SONIC_CONTEXT_MAX_CHARS_PER_HIT", 350),
+            sonic_context_max_total_chars=_env_int("SONIC_CONTEXT_MAX_TOTAL_CHARS", 1200),
+            sonic_context_retrieval_cooldown_seconds=_env_float("SONIC_CONTEXT_RETRIEVAL_COOLDOWN_SECONDS", 8.0),
             enable_aurora_writes=_env_bool("ENABLE_AURORA_WRITES", True),
             enable_redis_cache=_env_bool("ENABLE_REDIS_CACHE", True),
+            enable_sonic_context_retrieval=_env_bool("ENABLE_SONIC_CONTEXT_RETRIEVAL", True),
         )

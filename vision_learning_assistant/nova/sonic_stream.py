@@ -795,8 +795,18 @@ class NovaSonicWebSocketSession:
                     )
 
             content_end = event.get("contentEnd")
-            if isinstance(content_end, dict) and content_end.get("stopReason") == "INTERRUPTED":
-                await self._events.put({"type": "assistant_interrupted"})
+            if isinstance(content_end, dict):
+                stop_reason = str(content_end.get("stopReason", ""))
+                await self._events.put(
+                    {
+                        "type": "content_end",
+                        "role": self._current_text_role,
+                        "stop_reason": stop_reason,
+                    }
+                )
+                if stop_reason == "INTERRUPTED":
+                    await self._events.put({"type": "assistant_interrupted"})
+                self._current_text_role = ""
 
     async def _send_event(self, event: dict[str, Any]) -> None:
         """Serialize and send one event chunk to Bedrock input stream."""
