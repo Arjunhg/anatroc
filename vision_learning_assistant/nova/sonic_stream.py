@@ -1,4 +1,4 @@
-﻿"""Nova Sonic real-time voice streaming with barge-in support."""
+"""Nova Sonic real-time voice streaming with barge-in support."""
 
 from __future__ import annotations
 
@@ -557,7 +557,7 @@ class NovaSonicWebSocketSession:
         self._audio_content_has_data = False
         await self._send_audio_content_start_event()
 
-    async def send_context_update(self, context_text: str) -> None:
+    async def send_context_update(self, context_text: str, *, interactive: bool = True) -> None:
         """Inject latest visual context so Sonic stays aligned with screen state."""
         if not self._running:
             return
@@ -574,7 +574,7 @@ class NovaSonicWebSocketSession:
                         "contentName": context_content_name,
                         "type": "TEXT",
                         "role": "USER",
-                        "interactive": False,
+                        "interactive": interactive,
                         "textInputConfiguration": {"mediaType": "text/plain"},
                     }
                 }
@@ -586,7 +586,10 @@ class NovaSonicWebSocketSession:
                     "textInput": {
                         "promptName": self._prompt_name,
                         "contentName": context_content_name,
-                        "content": f"[Visual context update]\n{normalized}",
+                        "content": (
+                            "[SCREEN UPDATE] The following is the current text on the user's screen:\n\n"
+                            f"{normalized}"
+                        ),
                     }
                 }
             }

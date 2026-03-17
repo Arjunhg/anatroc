@@ -13,6 +13,7 @@ This server provides:
 from __future__ import annotations
 
 import base64
+import re
 import asyncio
 import contextlib
 import logging
@@ -79,6 +80,7 @@ class SessionRuntimeState:
     """In-memory runtime state for one frontend session."""
 
     session_id: str
+    run_id: str
     created_at: datetime
     frame_ingest_count: int = 0
     last_ingested_at: datetime | None = None
@@ -89,6 +91,9 @@ class SessionRuntimeState:
     overlay_updated_at: datetime | None = None
     overlay_position: str = "top-left"
     overlay_minimized: bool = False
+    last_sonic_ocr_push_at: float = 0.0
+    pending_sonic_ocr: str = ""
+    sonic_assistant_speaking: bool = False
 
 
 @dataclass(slots=True)
@@ -97,6 +102,7 @@ class SonicBridgeState:
 
     current_user_transcript_parts: list[str] = field(default_factory=list)
     current_assistant_transcript_parts: list[str] = field(default_factory=list)
+    last_user_transcript: str = ""
     last_context_payload: str = ""
     last_retrieval_at_monotonic: float = 0.0
     user_turn_count: int = 0
@@ -167,7 +173,7 @@ def schedule_aurora_maintenance(aurora_store: AuroraVectorStore):
                 await aurora_store.cleanup_embeddings()
                 # Run VACUUM ANALYZE every 4 hours
                 if int(datetime.now().hour) % 4 == 0:
-                    await asyncio.to_thread(run_vacuum_analyze, aurora_store._pool)
+                    await aurora_store.vacuum_analyze_embeddings()
             except Exception as exc:
                 LOGGER.warning("Aurora maintenance failed: %s", exc)
             await asyncio.sleep(3600)  # Run every hour
@@ -210,12 +216,16 @@ _SONIC_RETRIEVAL_HINTS = (
     "where",
     "initial",
     "initially",
+    "read",
+    "reading",
+    "screen",
+    "blog",
+    "article",
 )
 
 _OVERLAY_GENERATE_HINTS = (
     "diagram",
     "architecture",
-    "flow",
     "flowchart",
     "sequence",
     "workflow",
@@ -224,32 +234,108 @@ _OVERLAY_GENERATE_HINTS = (
 
 _OVERLAY_CLEAR_HINTS = (
     "remove overlay",
+    "remove the overlay",
+    "remove this overlay",
+    "remove diagram",
+    "remove the diagram",
+    "remove this diagram",
     "delete overlay",
+    "delete the overlay",
+    "delete diagram",
+    "delete the diagram",
     "clear overlay",
+    "clear the overlay",
+    "clear diagram",
+    "clear the diagram",
     "hide overlay",
+    "hide the overlay",
+    "hide diagram",
+    "hide the diagram",
     "close overlay",
+    "close the overlay",
+    "close diagram",
+    "close the diagram",
+    "get rid of the overlay",
+    "get rid of the diagram",
 )
 
 _OVERLAY_EXPORT_HINTS = (
     "export overlay",
+    "export the overlay",
     "export diagram",
+    "export the diagram",
+    "export this diagram",
     "download overlay",
+    "download the overlay",
     "download diagram",
+    "download the diagram",
     "copy overlay",
+    "copy the overlay",
     "copy diagram",
+    "copy the diagram",
+    "save diagram",
+    "save the diagram",
+    "save overlay",
+    "save the overlay",
 )
 
 _OVERLAY_MINIMIZE_HINTS = (
     "minimize overlay",
+    "minimize the overlay",
+    "minimize diagram",
+    "minimize the diagram",
     "collapse overlay",
+    "collapse the overlay",
+    "collapse diagram",
+    "collapse the diagram",
     "shrink overlay",
+    "shrink the overlay",
+    "shrink diagram",
+    "shrink the diagram",
+    "make it smaller",
+    "make the diagram smaller",
+    "make the overlay smaller",
 )
 
 _OVERLAY_EXPAND_HINTS = (
     "expand overlay",
+    "expand the overlay",
+    "expand diagram",
+    "expand the diagram",
     "maximize overlay",
+    "maximize the overlay",
+    "maximize diagram",
+    "maximize the diagram",
     "open overlay",
+    "open the overlay",
+    "open diagram",
+    "open the diagram",
     "restore overlay",
+    "restore the overlay",
+    "restore diagram",
+    "restore the diagram",
+    "make it bigger",
+    "make the diagram bigger",
+    "make the overlay bigger",
+    "show the diagram",
+    "show overlay",
+    "show the overlay",
+)
+
+_SONIC_RUNTIME_SYSTEM_PROMPT = (
+    DEFAULT_SONIC_SYSTEM_PROMPT
+    + " You have access to the user's screen through OCR text updates."
+    + " These updates arrive as messages starting with '[SCREEN UPDATE]'."
+    + " When you receive a screen update, briefly note what is on screen in 1-2 short sentences."
+    + " Do NOT repeat the same description if the screen content has not changed."
+    + " When the user asks you a question about the screen, answer in full detail."
+    + " You CAN see the screen — NEVER say you cannot see it or need an update."
+    + " NEVER ask the user to share their screen or provide text — you already have it."
+    + " You CAN generate architecture diagrams, flow diagrams, and visual overviews."
+    + " When the user asks for a diagram, say 'I will generate that diagram for you now' and describe what it will show."
+    + " NEVER say you cannot create or display diagrams — the system handles diagram rendering automatically."
+    + " You can also control the diagram overlay: export it, minimize it, expand it, move it, or remove it."
+    + " When the user asks to export, minimize, move, or remove the diagram, confirm the action briefly — e.g. 'Done, I have exported the diagram.'"
 )
 
 
@@ -301,6 +387,7 @@ def _ensure_session(session_id: str) -> SessionRuntimeState:
 
     state = SessionRuntimeState(
         session_id=normalized,
+        run_id=str(uuid.uuid4()),
         created_at=datetime.now(timezone.utc),
     )
     _sessions[normalized] = state
@@ -375,9 +462,58 @@ def _should_generate_overlay(prompt: str) -> bool:
         return False
     if not any(hint in normalized for hint in _OVERLAY_GENERATE_HINTS):
         return False
-    return any(
+    if any(
         verb in normalized
-        for verb in ("generate", "draw", "show", "create", "build", "make", "overlay")
+        for verb in ("generate", "draw", "show", "create", "build", "make", "overlay", "provide", "give")
+    ):
+        return True
+    return "overlay diagram" in normalized or "architecture diagram" in normalized
+
+
+def _should_force_context_refresh(prompt: str) -> bool:
+    """Force OCR context push for direct screen-reading prompts even when text is unchanged."""
+    normalized = prompt.lower().strip()
+    if not normalized:
+        return False
+    return any(
+        hint in normalized
+        for hint in (
+            "what am i reading",
+            "what i'm reading",
+            "what i am reading",
+            "on the screen",
+            "screen right now",
+            "reading right now",
+            "this article",
+            "this blog",
+            "this flow",
+        )
+    )
+
+
+def _is_screen_content_question(prompt: str) -> bool:
+    """Detect prompts asking what is currently visible/read on screen."""
+    normalized = prompt.lower().strip()
+    if not normalized:
+        return False
+    return any(
+        hint in normalized
+        for hint in (
+            "what am i reading",
+            "what i am reading",
+            "what i'm reading",
+            "reading about",
+            "what am i seeing",
+            "what i am seeing",
+            "what's on the screen",
+            "what is on the screen",
+            "on the screen",
+            "screen right now",
+            "currently reading",
+            "explain what i am reading",
+            "explain this",
+            "summarize what i have been reading",
+        )
     )
 
 
@@ -442,6 +578,7 @@ def _extract_overlay_position(prompt: str) -> str | None:
 async def _persist_sonic_memory(
     pipeline: VisionLearningPipeline,
     session_id: str,
+    session_run_id: str,
     content: str,
     source_type: str,
     turn_index: int,
@@ -455,6 +592,7 @@ async def _persist_sonic_memory(
         source_type=source_type,
         metadata={
             "session_id": session_id,
+            "session_run_id": session_run_id,
             "turn_index": turn_index,
             "channel": "sonic_websocket",
             "captured_at": datetime.now(timezone.utc).isoformat(),
@@ -549,7 +687,11 @@ async def _handle_sonic_overlay_intent(
         return
 
     try:
-        mermaid = await pipeline.generate_overlay_diagram(normalized_prompt)
+        mermaid = await pipeline.generate_overlay_diagram_for_session(
+            session_state.session_id,
+            normalized_prompt,
+            session_run_id=session_state.run_id,
+        )
     except Exception as exc:
         LOGGER.warning("Overlay diagram generation failed for session=%s: %s", session_state.session_id, exc)
         await websocket.send_json(
@@ -561,6 +703,13 @@ async def _handle_sonic_overlay_intent(
         return
 
     normalized_mermaid = mermaid.strip()
+    if not normalized_mermaid:
+        return
+
+    # Strip markdown fencing if present — mermaid.render() needs raw syntax
+    normalized_mermaid = re.sub(r'^```(?:mermaid)?\s*\n?', '', normalized_mermaid)
+    normalized_mermaid = re.sub(r'\n?```\s*$', '', normalized_mermaid)
+    normalized_mermaid = normalized_mermaid.strip()
     if not normalized_mermaid:
         return
 
@@ -585,6 +734,7 @@ async def _handle_sonic_overlay_intent(
 async def _build_sonic_context_payload(
     pipeline: VisionLearningPipeline,
     session_id: str,
+    session_run_id: str,
     user_prompt: str,
     bridge_state: SonicBridgeState,
 ) -> tuple[str, int]:
@@ -593,9 +743,18 @@ async def _build_sonic_context_payload(
     sections: list[str] = []
     used_chars = 0
 
+    normalized_prompt = user_prompt.strip()
+
+    if normalized_prompt:
+        sections.append(f"[User question]\n{_clip_text(normalized_prompt, 240)}")
+
     snapshot = pipeline.get_session_snapshot(session_id)
     latest_ocr = snapshot.ocr_text.strip() if snapshot and snapshot.ocr_text.strip() else ""
+    direct_screen_question = _is_screen_content_question(user_prompt)
     if latest_ocr:
+        sections.append(
+            "[Grounding rule]\nUse the OCR below as the source of truth for what is currently on screen."
+        )
         ocr_block = _clip_text(latest_ocr, min(config.sonic_context_max_total_chars, config.sonic_context_max_chars_per_hit))
         sections.append(f"[Current screen OCR]\n{ocr_block}")
         used_chars += len(ocr_block)
@@ -604,8 +763,9 @@ async def _build_sonic_context_payload(
     now_monotonic = time.monotonic()
     retrieval_allowed = (
         config.enable_sonic_context_retrieval
-        and user_prompt.strip()
+        and normalized_prompt
         and _should_retrieve_sonic_context(user_prompt)
+        and not (direct_screen_question and latest_ocr)
         and (
             bridge_state.last_retrieval_at_monotonic <= 0.0
             or now_monotonic - bridge_state.last_retrieval_at_monotonic
@@ -613,9 +773,15 @@ async def _build_sonic_context_payload(
         )
     )
     if retrieval_allowed:
+        retrieval_source_types = ["screen_share_ocr", "camera_ocr"]
+        if not direct_screen_question:
+            retrieval_source_types.extend(["sonic_user_turn", "sonic_assistant_turn"])
         retrieved = await pipeline.retrieve_context_memory(
             user_prompt,
             limit=config.sonic_context_max_results,
+            session_id=session_id,
+            session_run_id=session_run_id,
+            source_types=retrieval_source_types,
         )
         bridge_state.last_retrieval_at_monotonic = now_monotonic
         seen_contents = {latest_ocr}
@@ -651,11 +817,11 @@ async def _stop_sonic_session(session_id: str) -> None:
 async def _stop_sonic_websocket(session_id: str) -> None:
     """Close and remove active Sonic websocket for a session."""
     websocket = _sonic_websockets.pop(session_id, None)
+    _sonic_bridge_state.pop(session_id, None)
     if websocket is None:
         return
     with contextlib.suppress(Exception):
         await websocket.close(code=1000, reason="Session stopped")
-    _sonic_bridge_state.pop(session_id, None)
 
 
 
@@ -724,9 +890,19 @@ async def token(user_id: str = Query(min_length=1)) -> dict[str, str]:
 
 @app.post("/api/session/start")
 async def start_session(payload: StartSessionRequest) -> dict[str, Any]:
-    """Start or resume a pipeline session."""
+    """Start a fresh pipeline session."""
     session_id = (payload.session_id or str(uuid.uuid4())).strip()
-    _ensure_session(session_id)
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    if _pipeline is not None:
+        _pipeline.clear_session(session_id)
+    await _stop_sonic_session(session_id)
+    await _stop_sonic_websocket(session_id)
+    _sessions[session_id] = SessionRuntimeState(
+        session_id=session_id,
+        run_id=str(uuid.uuid4()),
+        created_at=datetime.now(timezone.utc),
+    )
     return {"status": "started", "session_id": session_id}
 
 
@@ -779,6 +955,7 @@ async def ingest_frame(payload: FrameIngestRequest) -> dict[str, Any]:
 
     result = await pipeline.ingest_screen_frame(
         session_id=state.session_id,
+        session_run_id=state.run_id,
         frame_bytes=frame_bytes,
         source_type=payload.source_type,
         analysis_prompt=payload.analysis_prompt,
@@ -788,6 +965,33 @@ async def ingest_frame(payload: FrameIngestRequest) -> dict[str, Any]:
         state.frame_ingest_count += 1
         state.last_ingested_at = result.ingested_at
         state.last_ocr_text = result.ocr_text
+
+        # Queue OCR for Sonic — only push if assistant is NOT speaking AND cooldown elapsed
+        sonic = _sonic_sessions.get(state.session_id)
+        if sonic and result.ocr_text.strip():
+            state.pending_sonic_ocr = _clip_text(result.ocr_text, 4000)
+            now_mono = time.monotonic()
+            cooldown_ok = now_mono - state.last_sonic_ocr_push_at >= 30.0
+            if not state.sonic_assistant_speaking and cooldown_ok:
+                try:
+                    await sonic.send_context_update(state.pending_sonic_ocr)
+                    state.pending_sonic_ocr = ""
+                    state.last_sonic_ocr_push_at = now_mono
+                    LOGGER.info(
+                        "Pushed ingest OCR to Sonic session=%s ocr_len=%d",
+                        state.session_id,
+                        len(result.ocr_text),
+                    )
+                except Exception as exc:
+                    LOGGER.warning("Failed pushing ingest OCR to Sonic: %s", exc)
+            else:
+                LOGGER.debug(
+                    "Queued OCR for Sonic (speaking=%s cooldown=%s) session=%s",
+                    state.sonic_assistant_speaking,
+                    not cooldown_ok,
+                    state.session_id,
+                )
+
         if result.analysis_result is not None:
             state.last_response_text = result.analysis_result.response_text
 
@@ -805,6 +1009,7 @@ async def voice_query(payload: VoiceQueryRequest) -> dict[str, Any]:
 
     result = await pipeline.answer_with_session_context(
         session_id=state.session_id,
+        session_run_id=state.run_id,
         prompt=prompt,
     )
     state.last_response_text = result.response_text
@@ -878,16 +1083,12 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
     sonic = NovaSonicWebSocketSession(
         region=_pipeline.config.aws_region,
         model_id=_pipeline.config.nova_sonic_model_id,
-        system_prompt=DEFAULT_SONIC_SYSTEM_PROMPT,
+        system_prompt=_SONIC_RUNTIME_SYSTEM_PROMPT,
     )
     _sonic_sessions[normalized_session_id] = sonic
 
     try:
         await sonic.start()
-        if state.last_ocr_text.strip():
-            initial_context = state.last_ocr_text.strip()[:4000]
-            await sonic.send_context_update(initial_context)
-            bridge_state.last_context_payload = f"[Current screen OCR]\n{initial_context}"
         await websocket.send_json(
             {
                 "type": "ready",
@@ -895,6 +1096,21 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
                 "output_sample_rate_hz": sonic.output_sample_rate_hz,
             }
         )
+
+        # Seed Sonic with existing screen OCR so it starts with awareness
+        snapshot = _pipeline.get_session_snapshot(normalized_session_id)
+        if snapshot and snapshot.ocr_text.strip():
+            try:
+                await sonic.send_context_update(
+                    _clip_text(snapshot.ocr_text, 4000)
+                )
+                LOGGER.info(
+                    "Seeded Sonic with existing OCR session=%s ocr_len=%d",
+                    normalized_session_id,
+                    len(snapshot.ocr_text),
+                )
+            except Exception as exc:
+                LOGGER.warning("Failed seeding Sonic with OCR: %s", exc)
         if state.overlay_mermaid.strip():
             await websocket.send_json(
                 {
@@ -949,11 +1165,15 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
                     LOGGER.info("Sonic audio turn end received for session=%s", normalized_session_id)
                     await asyncio.sleep(0.15)
                     user_prompt = _collapse_transcript_chunks(bridge_state.current_user_transcript_parts)
+                    if not user_prompt:
+                        # Avoid reusing stale prompts from prior turns.
+                        user_prompt = ""
                     if user_prompt:
                         bridge_state.user_turn_count += 1
                         await _persist_sonic_memory(
                             _pipeline,
                             normalized_session_id,
+                            state.run_id,
                             user_prompt,
                             "sonic_user_turn",
                             bridge_state.user_turn_count,
@@ -967,15 +1187,19 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
                     context_payload, retrieved_count = await _build_sonic_context_payload(
                         _pipeline,
                         normalized_session_id,
+                        state.run_id,
                         user_prompt,
                         bridge_state,
                     )
-                    if context_payload and context_payload != bridge_state.last_context_payload:
-                        await sonic.send_context_update(context_payload)
+                    context_source = "retrieval"
+                    should_push_context = bool(context_payload)
+                    if should_push_context:
+                        await sonic.send_context_update(context_payload, interactive=True)
                         bridge_state.last_context_payload = context_payload
                         LOGGER.info(
-                            "Applied Sonic context session=%s retrieved_hits=%d ocr_present=%s",
+                            "Applied Sonic context session=%s source=%s retrieved_hits=%d ocr_present=%s",
                             normalized_session_id,
+                            context_source,
                             retrieved_count,
                             "[Current screen OCR]" in context_payload,
                         )
@@ -984,9 +1208,14 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
                                 "type": "context_applied",
                                 "retrieved_hits": retrieved_count,
                                 "has_current_ocr": "[Current screen OCR]" in context_payload,
+                                "source": context_source,
                             }
                         )
+
+                    # Small guard to let context updates flush before ending user turn.
+                    await asyncio.sleep(0.08)
                     bridge_state.current_user_transcript_parts.clear()
+                    bridge_state.last_user_transcript = ""
                     await sonic.end_user_audio_turn()
                     continue
 
@@ -1070,25 +1299,52 @@ async def sonic_ws(websocket: WebSocket, session_id: str) -> None:
                     text = str(event.get("text", ""))
                     if role == "user":
                         _append_transcript_chunk(bridge_state.current_user_transcript_parts, text)
+                        bridge_state.last_user_transcript = _collapse_transcript_chunks(
+                            bridge_state.current_user_transcript_parts
+                        )
                     elif role == "assistant":
                         _append_transcript_chunk(bridge_state.current_assistant_transcript_parts, text)
+                        state.sonic_assistant_speaking = True
                 elif event_type == "content_end":
                     role = str(event.get("role", "")).lower()
                     if role == "assistant":
+                        state.sonic_assistant_speaking = False
                         assistant_text = _collapse_transcript_chunks(bridge_state.current_assistant_transcript_parts)
                         if assistant_text:
                             bridge_state.assistant_turn_count += 1
                             await _persist_sonic_memory(
                                 _pipeline,
                                 normalized_session_id,
+                                state.run_id,
                                 assistant_text,
                                 "sonic_assistant_turn",
                                 bridge_state.assistant_turn_count,
                             )
                         bridge_state.current_assistant_transcript_parts.clear()
+
+                        # Flush pending OCR now that assistant finished speaking (with cooldown)
+                        now_mono = time.monotonic()
+                        if (
+                            state.pending_sonic_ocr
+                            and now_mono - state.last_sonic_ocr_push_at >= 30.0
+                        ):
+                            try:
+                                await sonic.send_context_update(state.pending_sonic_ocr)
+                                LOGGER.info(
+                                    "Flushed pending OCR to Sonic session=%s ocr_len=%d",
+                                    normalized_session_id,
+                                    len(state.pending_sonic_ocr),
+                                )
+                                state.pending_sonic_ocr = ""
+                                state.last_sonic_ocr_push_at = now_mono
+                            except Exception as exc:
+                                LOGGER.warning("Failed flushing pending OCR to Sonic: %s", exc)
+
                     elif role == "user":
-                        bridge_state.current_user_transcript_parts.clear()
+                        # Keep user transcript chunks until frontend emits audio_turn_end.
+                        pass
                 elif event_type == "assistant_interrupted":
+                    state.sonic_assistant_speaking = False
                     bridge_state.current_assistant_transcript_parts.clear()
                 if (
                     downstream_count == 1

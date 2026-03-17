@@ -145,15 +145,26 @@ class NovaBedrockClient:
         self,
         prompt: str,
         image_bytes: bytes | None,
+        current_ocr_text: str | None = None,
         retrieved_context: Sequence[str] | None = None,
     ) -> str:
         """Run Nova Lite screen reasoning using text plus optional frame bytes."""
         context_blocks = [block.strip() for block in (retrieved_context or []) if block.strip()]
 
         user_content: list[dict[str, Any]] = []
+        normalized_ocr = (current_ocr_text or "").strip()
+        if normalized_ocr:
+            user_content.append(
+                {
+                    "text": (
+                        "Current OCR text from the latest shared screen frame:\n"
+                        f"{normalized_ocr}"
+                    )
+                }
+            )
         if context_blocks:
             joined_context = "\n\n".join(context_blocks)
-            user_content.append({"text": f"Relevant prior context:\n{joined_context}"})
+            user_content.append({"text": f"Earlier context from this same session:\n{joined_context}"})
 
         user_content.append({"text": f"User request:\n{prompt.strip()}"})
 
@@ -172,9 +183,13 @@ class NovaBedrockClient:
             system=[
                 {
                     "text": (
-                        "You are a precise learning assistant. Use available visual and retrieved context. "
+                        "You are a precise learning assistant. "
+                        "Treat the current image and the current OCR text as the primary source of truth. "
+                        "Use earlier retrieved context only as a secondary hint from the same session. "
+                        "If earlier context conflicts with the current screen, ignore the earlier context. "
+                        "Describe exactly what is visible now, not what may have appeared earlier. "
                         "Return concise, actionable guidance in plain language. "
-                        "If context is insufficient, say exactly what is missing."
+                        "If the current screen is unreadable or insufficient, say exactly what is missing."
                     )
                 }
             ],
