@@ -26,10 +26,19 @@ interface SessionOverlayDiagram {
 
 const CAPTURE_INTERVAL_MS = Math.max(
   1000,
-  Number(import.meta.env.VITE_SCREEN_CAPTURE_INTERVAL_SECONDS ?? '3') * 1000,
+  Number(import.meta.env.VITE_SCREEN_CAPTURE_INTERVAL_SECONDS ?? '4') * 1000,
+)
+const CAPTURE_MAX_WIDTH = Math.max(640, Number(import.meta.env.VITE_SCREEN_CAPTURE_MAX_WIDTH ?? '1280'))
+const CAPTURE_JPEG_QUALITY = Math.min(
+  0.9,
+  Math.max(0.45, Number(import.meta.env.VITE_SCREEN_CAPTURE_JPEG_QUALITY ?? '0.68')),
 )
 const SONIC_SPEECH_THRESHOLD = Math.max(10, Number(import.meta.env.VITE_SONIC_SPEECH_THRESHOLD ?? '120'))
 const SONIC_TURN_SILENCE_MS = Math.max(300, Number(import.meta.env.VITE_SONIC_TURN_SILENCE_MS ?? '1200'))
+const SONIC_PLAYBACK_MIC_SUPPRESSION_MS = Math.max(
+  0,
+  Number(import.meta.env.VITE_SONIC_PLAYBACK_MIC_SUPPRESSION_MS ?? '450'),
+)
 
 function downsampleFloat32(input: Float32Array, inputRate: number, outputRate: number): Float32Array {
   if (outputRate >= inputRate) return input
@@ -129,6 +138,8 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
   const sonicMicChunkCountRef = useRef(0)
   const sonicLastSpeechAtRef = useRef(0)
   const sonicTurnHasSpeechRef = useRef(false)
+  const assistantPlaybackActiveRef = useRef(false)
+  const assistantPlaybackMuteUntilRef = useRef(0)
 
   useEffect(() => {
     const timer = window.setInterval(() => setElapsed((sec) => sec + 1), 1000)
@@ -152,6 +163,8 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
     sonicReadyRef.current = false
     sonicMicChunkCountRef.current = 0
     sonicLastSpeechAtRef.current = 0
+    assistantPlaybackActiveRef.current = false
+    assistantPlaybackMuteUntilRef.current = 0
 
     if (socket && socket.readyState === WebSocket.OPEN) {
       if (sonicTurnHasSpeechRef.current) {
@@ -195,6 +208,7 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
     if (playbackLoopActiveRef.current) return
     playbackLoopActiveRef.current = true
     try {
+      assistantPlaybackActiveRef.current = true
       while (playbackQueueRef.current.length > 0) {
         const next = playbackQueueRef.current.shift()
         if (!next) break
@@ -219,6 +233,8 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
         })
       }
     } finally {
+      assistantPlaybackActiveRef.current = false
+      assistantPlaybackMuteUntilRef.current = Date.now() + SONIC_PLAYBACK_MIC_SUPPRESSION_MS
       playbackLoopActiveRef.current = false
     }
   }
@@ -300,9 +316,9 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
           const rawPosition = String(payload.position ?? 'top-left').trim().toLowerCase()
           const position =
             rawPosition === 'top-right' ||
-            rawPosition === 'bottom-left' ||
-            rawPosition === 'bottom-right' ||
-            rawPosition === 'center'
+              rawPosition === 'bottom-left' ||
+              rawPosition === 'bottom-right' ||
+              rawPosition === 'center'
               ? rawPosition
               : 'top-left'
           const minimized = Boolean(payload.minimized ?? false)
@@ -323,9 +339,9 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
               if (!prev) return prev
               const position =
                 rawPosition === 'top-right' ||
-                rawPosition === 'bottom-left' ||
-                rawPosition === 'bottom-right' ||
-                rawPosition === 'center'
+                  rawPosition === 'bottom-left' ||
+                  rawPosition === 'bottom-right' ||
+                  rawPosition === 'center'
                   ? rawPosition
                   : 'top-left'
               return { ...prev, position }
@@ -410,6 +426,11 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
         const ws = sonicSocketRef.current
         if (!ws || ws.readyState !== WebSocket.OPEN || !sonicReadyRef.current) return
 
+        const now = Date.now()
+        if (assistantPlaybackActiveRef.current || now < assistantPlaybackMuteUntilRef.current) {
+          return
+        }
+
         const channelData = audioProcessEvent.inputBuffer.getChannelData(0)
         const pcmInput =
           micContext.sampleRate === 16000 ? channelData : downsampleFloat32(channelData, micContext.sampleRate, 16000)
@@ -419,7 +440,6 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
           amplitudeTotal += Math.abs(pcm16[i])
         }
         const avgAbs = amplitudeTotal / Math.max(1, pcm16.length)
-        const now = Date.now()
         if (avgAbs >= SONIC_SPEECH_THRESHOLD) {
           sonicTurnHasSpeechRef.current = true
           sonicLastSpeechAtRef.current = now
@@ -483,11 +503,12 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
 
       ingestBusyRef.current = true
       try {
-        captureCanvas.width = captureVideo.videoWidth
-        captureCanvas.height = captureVideo.videoHeight
+        const scaleRatio = Math.min(1, CAPTURE_MAX_WIDTH / captureVideo.videoWidth)
+        captureCanvas.width = Math.max(1, Math.round(captureVideo.videoWidth * scaleRatio))
+        captureCanvas.height = Math.max(1, Math.round(captureVideo.videoHeight * scaleRatio))
         captureContext.drawImage(captureVideo, 0, 0, captureCanvas.width, captureCanvas.height)
 
-        const imageDataUrl = captureCanvas.toDataURL('image/jpeg', 0.78)
+        const imageDataUrl = captureCanvas.toDataURL('image/jpeg', CAPTURE_JPEG_QUALITY)
         const result = await ingestScreenFrame(sessionId, imageDataUrl, analysisPromptRef.current)
 
         if (!result.processed) {
@@ -497,7 +518,9 @@ export default function CallScreen({ sessionId, onLeave }: Props) {
 
         setFramesProcessed((count) => count + 1)
         setLastOcr(result.ocr_text ?? '')
-        setIngestStatus(`Frame indexed at ${new Date(result.ingested_at).toLocaleTimeString()}`)
+        setIngestStatus(
+          `Frame indexed at ${new Date(result.ingested_at).toLocaleTimeString()} (${captureCanvas.width}x${captureCanvas.height})`,
+        )
 
         if (result.analysis) {
           setAssistantReply(result.analysis.response_text)

@@ -93,6 +93,7 @@ class VisionLearningPipeline:
         session_id: str,
         frame_path: str,
         prompt: str,
+        session_run_id: str | None = None,
     ) -> ScreenAnalysisResult:
         """Analyze a local frame file and return Nova response."""
         image_path = Path(frame_path)
@@ -100,15 +101,25 @@ class VisionLearningPipeline:
             raise FileNotFoundError(f"Frame path does not exist: {frame_path}")
 
         frame_bytes = image_path.read_bytes()
+        ocr_text = (await asyncio.to_thread(self._nova_client.extract_text_from_image, frame_bytes)).strip()
+        self._session_frames[session_id] = SessionFrameSnapshot(
+            frame_bytes=frame_bytes,
+            ocr_text=ocr_text,
+            source_type="screen_file",
+            ingested_at=datetime.now(timezone.utc),
+        )
         return await self._screen_analysis.analyze_screen_frame(
             session_id=session_id,
+            session_run_id=session_run_id,
             user_prompt=prompt,
             frame_bytes=frame_bytes,
+            ocr_text=ocr_text,
         )
 
     async def ingest_screen_frame(
         self,
         session_id: str,
+        session_run_id: str | None,
         frame_bytes: bytes,
         source_type: str = "screen_share",
         analysis_prompt: str | None = None,
@@ -141,6 +152,7 @@ class VisionLearningPipeline:
                 source_type=f"{source_type}_ocr",
                 metadata={
                     "session_id": session_id,
+                    "session_run_id": session_run_id,
                     "captured_at": ingested_at.isoformat(),
                     "source_type": source_type,
                 },
@@ -157,6 +169,7 @@ class VisionLearningPipeline:
         if analysis_prompt and analysis_prompt.strip():
             analysis_result = await self._screen_analysis.analyze_screen_frame(
                 session_id=session_id,
+                session_run_id=session_run_id,
                 user_prompt=analysis_prompt,
                 frame_bytes=frame_bytes,
                 ocr_text=ocr_text,
@@ -172,7 +185,12 @@ class VisionLearningPipeline:
             ingested_at=ingested_at,
         )
 
-    async def answer_with_session_context(self, session_id: str, prompt: str) -> ScreenAnalysisResult:
+    async def answer_with_session_context(
+        self,
+        session_id: str,
+        session_run_id: str | None,
+        prompt: str,
+    ) -> ScreenAnalysisResult:
         """Answer a user prompt using the latest ingested session frame context."""
         snapshot = self._session_frames.get(session_id)
         frame_bytes = snapshot.frame_bytes if snapshot else None
@@ -180,6 +198,7 @@ class VisionLearningPipeline:
 
         return await self._screen_analysis.analyze_screen_frame(
             session_id=session_id,
+            session_run_id=session_run_id,
             user_prompt=prompt,
             frame_bytes=frame_bytes,
             ocr_text=ocr_text,
@@ -189,9 +208,18 @@ class VisionLearningPipeline:
         self,
         prompt: str,
         limit: int | None = None,
+        session_id: str | None = None,
+        session_run_id: str | None = None,
+        source_types: list[str] | None = None,
     ) -> list[RetrievedContext]:
         """Expose shared retrieval memory for non-Lite runtime paths."""
-        return await self._memory.retrieve(prompt, limit)
+        return await self._memory.retrieve_for_session(
+            question=prompt,
+            limit=limit,
+            session_id=session_id,
+            session_run_id=session_run_id,
+            source_types=source_types,
+        )
 
     async def index_session_memory(
         self,
@@ -216,11 +244,40 @@ class VisionLearningPipeline:
     def clear_session(self, session_id: str) -> None:
         """Clear in-memory frame state for a session."""
         self._session_frames.pop(session_id, None)
+        self._screen_analysis.clear_session(session_id)
 
     async def generate_overlay_diagram(self, prompt: str) -> str:
         """Generate Mermaid overlay diagram text from a user request."""
-        context = await self._memory.retrieve(prompt)
+        context = await self._memory.retrieve_for_session(question=prompt)
         return await self._screen_analysis.generate_overlay_mermaid(prompt, context)
+
+    async def generate_overlay_diagram_for_session(
+        self,
+        session_id: str,
+        prompt: str,
+        session_run_id: str | None = None,
+    ) -> str:
+        """Generate Mermaid using retrieval plus the latest session OCR when available."""
+        retrieved = await self._memory.retrieve_for_session(
+            question=prompt,
+            session_id=session_id,
+            session_run_id=session_run_id,
+            source_types=["screen_share_ocr", "camera_ocr"],
+        )
+        snapshot = self._session_frames.get(session_id)
+        if snapshot and snapshot.ocr_text.strip():
+            retrieved = [
+                RetrievedContext(
+                    id="session-current-ocr",
+                    content=snapshot.ocr_text.strip(),
+                    source_type="current_screen_ocr",
+                    metadata={"session_id": session_id, "session_run_id": session_run_id},
+                    score=1.0,
+                    created_at=snapshot.ingested_at,
+                ),
+                *retrieved,
+            ]
+        return await self._screen_analysis.generate_overlay_mermaid(prompt, retrieved)
 
     @property
     def config(self) -> AssistantConfig:

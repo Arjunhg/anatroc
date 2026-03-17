@@ -93,10 +93,20 @@ class AuroraVectorStore:
         self,
         query_embedding: list[float],
         limit: int = 5,
+        session_id: str | None = None,
+        session_run_id: str | None = None,
+        source_types: list[str] | None = None,
     ) -> list[RetrievedContext]:
         """Run cosine-similarity vector search and return ranked hits."""
         try:
-            rows = await asyncio.to_thread(self._similarity_search_sync, query_embedding, limit)
+            rows = await asyncio.to_thread(
+                self._similarity_search_sync,
+                query_embedding,
+                limit,
+                session_id,
+                session_run_id,
+                source_types,
+            )
         except Exception as exc:
             LOGGER.warning("Aurora similarity search failed: %s", exc)
             return []
@@ -166,14 +176,38 @@ class AuroraVectorStore:
                 )
             conn.commit()
 
-    def _similarity_search_sync(self, query_embedding: list[float], limit: int) -> list[tuple[Any, ...]]:
+    def _similarity_search_sync(
+        self,
+        query_embedding: list[float],
+        limit: int,
+        session_id: str | None,
+        session_run_id: str | None,
+        source_types: list[str] | None,
+    ) -> list[tuple[Any, ...]]:
         """Fetch nearest rows in a blocking context."""
         vector_literal = _vector_literal(query_embedding)
+        filters: list[str] = ["created_at > NOW() - INTERVAL '10 minutes'"]
+        params: list[Any] = []
+
+        if session_id and session_id.strip():
+            filters.append("metadata ->> 'session_id' = %s")
+            params.append(session_id.strip())
+
+        if session_run_id and session_run_id.strip():
+            filters.append("metadata ->> 'session_run_id' = %s")
+            params.append(session_run_id.strip())
+
+        normalized_source_types = [value.strip() for value in (source_types or []) if value and value.strip()]
+        if normalized_source_types:
+            filters.append("source_type = ANY(%s)")
+            params.append(normalized_source_types)
+
+        where_clause = " AND ".join(filters)
 
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT
                         id::text,
                         content,
@@ -182,32 +216,41 @@ class AuroraVectorStore:
                         created_at,
                         (1 - (embedding <=> %s::vector)) AS score
                     FROM embeddings
-                    WHERE created_at > NOW() - INTERVAL '10 minutes'
+                    WHERE {where_clause}
                     ORDER by embedding <=> %s::vector
                     LIMIT %s
                     """,
-                    (vector_literal, vector_literal, limit),
+                    [vector_literal, *params, vector_literal, limit],
                 )
                 return cur.fetchall()
+
+    async def cleanup_embeddings(self) -> None:
+        """Delete long-lived rows to keep storage bounded."""
+        await asyncio.to_thread(self._cleanup_embeddings_sync)
+
+    def _cleanup_embeddings_sync(self) -> None:
+        """Delete rows older than retention period."""
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                        DELETE FROM embeddings
+                        WHERE created_at < NOW() - INTERVAL '24 hours'
+                    """
+                )
+            conn.commit()
+
+    async def vacuum_analyze_embeddings(self) -> None:
+        """Run VACUUM ANALYZE for healthier planner stats after churn."""
+        await asyncio.to_thread(self._vacuum_analyze_embeddings_sync)
+
+    def _vacuum_analyze_embeddings_sync(self) -> None:
+        """Execute VACUUM ANALYZE in autocommit mode (required by PostgreSQL)."""
+        with psycopg.connect(self._database_url, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("VACUUM ANALYZE embeddings")
 
 
 def _vector_literal(values: list[float]) -> str:
     """Convert Python float list to PostgreSQL vector literal."""
     return "[" + ",".join(f"{float(value):.8f}" for value in values) + "]"
-
-# Long term memory of 24 hours. Short term is of 10 miniues defined in similarity search.
-async def cleanup_embeddings(self) -> None:
-    await asyncio.to_thread(self._cleanup_embeddings_sync)
-
-def _cleanup_embeddings_sync(self) -> None:
-    """Delete rows older than retention period."""
-    with self._pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                    DELETE FROM embeddings
-                    WHERE created_at < NOW() - INTERVAL '24 hours'
-                """
-            )
-        conn.commit()
-

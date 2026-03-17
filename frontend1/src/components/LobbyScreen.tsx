@@ -30,10 +30,10 @@ export default function LobbyScreen({ loading, error, onJoin }: Props) {
     <div className="lobby-root">
       <header className="lobby-header">
         <div className="lobby-logo">
-          <span className="lobby-logo-icon">[N]</span>
-          <span className="lobby-logo-text">Nova Studio</span>
+          <span className="lobby-logo-icon">[A]</span>
+          <span className="lobby-logo-text">Anatroc</span>
         </div>
-        <p className="lobby-tagline">Stream call + Nova pipeline session in one flow</p>
+        <p className="lobby-tagline">Stream call + pipeline session in one flow</p>
       </header>
 
       <div className="lobby-card">
@@ -65,7 +65,7 @@ export default function LobbyScreen({ loading, error, onJoin }: Props) {
               disabled={loading}
               autoComplete="off"
             />
-            <span className="form-hint">Use the same ID for Stream call and Nova backend session.</span>
+            <span className="form-hint">Use the same ID for Stream call and backend session.</span>
           </label>
 
           <div className="mode-hint">

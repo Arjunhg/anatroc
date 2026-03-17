@@ -68,12 +68,29 @@ class ContextMemoryService:
 
     async def retrieve(self, question: str, limit: int | None = None) -> list[RetrievedContext]:
         """Retrieve relevant memory for a question using embedding similarity."""
+        return await self.retrieve_for_session(question=question, limit=limit)
+
+    async def retrieve_for_session(
+        self,
+        question: str,
+        limit: int | None = None,
+        session_id: str | None = None,
+        session_run_id: str | None = None,
+        source_types: list[str] | None = None,
+    ) -> list[RetrievedContext]:
+        """Retrieve relevant memory for a question with optional session and source filters."""
         normalized_question = question.strip()
         if not normalized_question:
             return []
 
         requested_limit = max(1, limit or self._default_limit)
-        cache_key = self._cache_key(normalized_question, requested_limit)
+        cache_key = self._cache_key(
+            question=normalized_question,
+            limit=requested_limit,
+            session_id=session_id,
+            session_run_id=session_run_id,
+            source_types=source_types,
+        )
 
         cached = await self._redis_cache.get_json(cache_key)
         if isinstance(cached, list):
@@ -86,7 +103,13 @@ class ContextMemoryService:
             normalized_question,
             "DOCUMENT_RETRIEVAL",
         )
-        results = await self._vector_store.similarity_search(query_embedding, requested_limit)
+        results = await self._vector_store.similarity_search(
+            query_embedding,
+            requested_limit,
+            session_id=session_id,
+            session_run_id=session_run_id,
+            source_types=source_types,
+        )
 
         await self._redis_cache.set_json(
             key=cache_key,
@@ -96,10 +119,20 @@ class ContextMemoryService:
         return results
 
     @staticmethod
-    def _cache_key(question: str, limit: int) -> str:
+    def _cache_key(
+        question: str,
+        limit: int,
+        session_id: str | None = None,
+        session_run_id: str | None = None,
+        source_types: list[str] | None = None,
+    ) -> str:
         """Build deterministic Redis key for retrieval cache entries."""
         normalized_text = ContextMemoryService._normalize_question(question)
-        digest = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
+        normalized_session = (session_id or "global").strip() or "global"
+        normalized_run = (session_run_id or "default").strip() or "default"
+        normalized_sources = ",".join(sorted(value.strip() for value in (source_types or []) if value and value.strip()))
+        raw_key = f"{normalized_session}|{normalized_run}|{normalized_sources}|{normalized_text}"
+        digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
         return f"context:retrieval:{digest}:{limit}"
     
     @staticmethod
